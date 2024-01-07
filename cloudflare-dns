@@ -1,0 +1,393 @@
+#!/bin/bash
+#===============================================================================
+# cloudflare-dns : Cloudflare DNS record manage script
+# Date    :  2024/01/07 Start
+# Copyright: Original code by Yusuke Komori.
+#                  Copyright (c) 2024. Yusuke Komori, All rights reserved.
+#===============================================================================
+
+SCRIPT_BASE=`echo $(cd $(dirname $0); pwd)`
+SCRIPT_NAME=`basename $0`
+
+RC_FNAME="cloudflare-dns.conf"
+RC_FILES=(${HOME}/.${RC_FNAME} /etc/${RC_FNAME} ./${RC_FNAME})
+JQ=jq
+JQ_PATH=(/bin/jq /usr/bin/jq /usr/local/bin/jq)
+
+#-------------------------------------------------------------------------------
+#- common functions ------------------------------------------------------------
+
+__setupcolor() { #{{{
+  local C
+  local COLOR=(BLACK RED GREEN YELLOW BLUE MAGENTA CYAN WHITE GRAY)
+  local STYLE=(OFF BOLD REV UL)
+
+  # Escape sequence
+  ESC="\e["
+  ESCEND=m
+
+  # define empty valiable
+  for C in ${STYLE[@]}; do
+    eval "C_${C}="
+  done
+  for C in ${COLOR[@]}; do
+    eval "C_${C}="
+    eval "C_B_${C}="
+  done
+
+  tty -s || return
+  C_OFF=`tput sgr0`   # Reset attribute
+  C_BOLD=`tput bold`
+  C_REV=`tput rev`    # Reverse mode
+  C_UL=`tput smul`    # Underline mode
+
+  # Background
+  C_B_BLACK=`tput setab 0`
+  C_B_RED=`tput setab 1`
+  C_B_GREEN=`tput setab 2`
+  C_B_YELLOW=`tput setab 3`
+  C_B_BLUE=`tput setab 4`
+  C_B_MAGENTA=`tput setab 5`
+  C_B_CYAN=`tput setab 6`
+  C_B_WHITE=`tput setab 7`
+  C_B_GRAY=`tput setab 102`
+
+  # Foreground
+  C_BLACK=`tput setaf 0`
+  C_RED=`tput setaf 1`
+  C_GREEN=`tput setaf 2`
+  C_YELLOW=`tput setaf 3`
+  C_BLUE=`tput setaf 4`
+  C_MAGENTA=`tput setaf 5`
+  C_CYAN=`tput setaf 6`
+  C_WHITE="${C_BOLD}`tput setaf 7`"
+  C_GRAY=`tput setaf 102`
+
+  RES_COL=60
+  MOVE_TO_COL="echo -en \\033[${RES_COL}G"
+}
+#}}}
+
+__show_ok() { #{{{
+  [ "${SILENT_MODE}" ] && return
+  [[ "$1" && "$1" -gt 0 ]] && echo -en "\\033[${1}G"
+  echo -en "[ ${C_GREEN}OK${C_OFF}"
+  [ "$2" ] && echo " ]$2" || echo " ]"
+}
+#}}}
+
+__show_info() { #{{{
+  [[ -n "${SILENT_MODE}" ]] && return
+  [[ "$1" == "-n" ]] && echo -en "${C_CYAN}${2}${C_OFF}" || echo -e "${C_CYAN}${1}${C_OFF}"
+}
+#}}}
+
+__show_error() { #{{{
+  local MSG="$1"
+  if [[ -z "$MSG" ]]; then
+    MSG=`sed -re '/^[ \t]*$/d' | tr -d "\n"`
+  fi
+  tty -s || __syslog "[ERROR] $MSG" 'error'
+  echo -e "[${C_RED}ERROR${C_OFF}] $MSG"
+}
+#}}}
+
+__error_end() { #{{{
+  __show_error "$1"; exit 1
+}
+#}}}
+
+__get_tmp_base() { #{{{
+  local TMP_BASE
+  if [[ `uname` != Darwin ]]; then
+    [[ -d /dev/shm ]] && TMP_BASE=/dev/shm/ || TMP_BASE=/tmp/
+  fi
+  TMP_BASE="${TMP_BASE}tmp.`basename $0`.$$"
+  [[ ! -d "$TMP_BASE" ]] && mkdir "$TMP_BASE"
+  echo "$TMP_BASE"
+}
+#}}}
+
+__make_tmp() { #{{{
+  local TMP_BASE=`__get_tmp_base`
+  local OPT=()
+  [[ "$1" == '-d' ]] && OPT+=($1)
+  [[ `uname` == Darwin ]] && OPT+=('-t') || OPT+=('-p')
+  OPT+=("$TMP_BASE")
+  mktemp ${OPT[@]}
+}
+#}}}
+
+__script_end_clean_tmp() { #{{{
+  local TMP_BASE=`__get_tmp_base`
+  [[ -d "$TMP_BASE" ]] && rm -rf "${TMP_BASE}"
+}
+#}}}
+
+__script_end() { #{{{
+  local FUNC
+  while read FUNC; do
+    $FUNC
+  done < <(declare -F | sed -e 's/^declare -f //' | egrep '^__?script_end_.+' | sort)
+}
+trap '__script_end' EXIT
+#}}}
+
+#-------------------------------------------------------------------------------
+#- functions -------------------------------------------------------------------
+
+# usage
+#{{{
+_usage() {
+  [[ -n "$1" ]] && __show_error "$1"
+  ( ! tty -s || [[ -n "$1" ]] ) && echo "ERROR: $1" >&2
+  cat <<- EOM
+	${C_WHITE}Usege:${C_OFF}
+	  $SCRIPT_NAME (get|update|auto-update|show-ip) [-h] [-z ZONE_ID] [-n NAME] [-t TYPE] [-l TTL] [-v VALUE]
+	    get:         Get DNS record (type and name should be specified)
+	    update:      Update DNS A record
+	    auto-update: Update DNS A record using IP_SUPPLIER_SCRIPT
+	    show-ip:     Show IP address using IP_SUPPLIER_SCRIPT
+	          -z : Cloudflare zone ID
+	          -n : DNS record name (ex: example.com)
+	          -t : DNS record type (ex: A, CNAME, TXT, ...)
+	          -v : DNS record value
+            -l : TTL to set (optional)
+	          -V : Verbode mode
+	          -h : display usage
+	
+	${C_WHITE}Configuration file:${C_OFF}
+	  You can configure some options in ${RC_FILES[*]}.
+	  Here is example configuration.
+	
+	      CLOUDFLARE_API_TOKEN=XXXXXXXXXXXXXXXXXXXX
+	      ZONE_ID=XXXXXXXXXXXXXXXXXXXX
+	      IP_SUPPLIER_SCRIPT=\"/usr/local/bin/xxxx\"
+	
+	  If both files are specified, ./${RC_FNAME} will take precedence.
+	
+	${C_WHITE}Example:${C_OFF}
+	  * Get all record set of specified zone.
+	      $SCRIPT_NAME get -z ZONE_ID -V
+	
+	  * Get Sepcified DNS record.
+	      $SCRIPT_NAME get -z ZONE_ID -t A -n example.com
+	
+	  * Update DNS A record.
+	      $SCRIPT_NAME update -z ZONE_ID -t A -n example.com -v IP_ADDRESS
+	
+	  * Auto-Update DNS A record.
+	      (IP address is auto-accuired using IP_SUPPLIER_SCRIPT specified in ${RC_FNAME})
+	      $SCRIPT_NAME auto-update -z ZONE_ID -t A -n example.com
+	EOM
+  exit 1
+}
+#}}}
+
+_get_record() { #{{{
+  local ZONE_ID="$1"
+  local NAME="$2"
+  local TYPE="$3"
+
+  local Q=".result[]"
+  if [[ -n "${TYPE}" ]]; then
+    Q="$Q | select(.name == \"${NAME}\" and .type == \"${TYPE}\")"
+  elif [[ -n "${NAME}" ]]; then
+    Q="$Q | select(.name == \"${NAME}\")"
+  fi
+
+  curl -s https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records \
+    -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    | jq "${Q}"
+}
+#}}}
+
+_update() { #{{{
+  local ZONE_ID=$1
+  local DOMAIN=$2
+  local TYPE=$3
+  local VALUE=$4
+  local TTL=$5
+
+  [[ ! "$DOMAIN" ]] && _usage "Domain is not specified."
+  [[ ! "$TYPE" ]] && _usage "Type is not specified."
+  [[ ! "$VALUE" ]] && _usage "Value is not specified."
+
+  local CHANGED=no
+
+  local T_RESULT=`__make_tmp`
+  _get_record "${ZONE_ID}" "${DOMAIN}" "${TYPE}" > $T_RESULT
+
+  local RECORD_ID=`jq -r '.id' ${T_RESULT}`
+  [[ ! "${RECORD_ID}" =~ ^[0-9a-f]+$ ]] && __error_end "Could not get record id : ${DOMAIN} ${TYPE}" 
+
+  local CUR_VALUE=`jq -r '.content' ${T_RESULT}`
+  [[ "$CUR_VALUE" != "${VALUE}" ]] && CHANGED=yes
+
+  local CUR_TTL=`jq -r '.ttl' ${T_RESULT}`
+  if [[ -n "${TTL}" ]]; then
+    [[ "$CUR_TTL" != "${TTL}" ]] && CHANGED=yes
+  else
+    TTL=${CUR_TTL}
+  fi
+
+  [[ "${CHANGED}" != 'yes' ]] && return
+
+  local COMMENT="Updated by ${SCRIPT_NAME} at `date '+%Y-%m-%dT%H:%M:%S%z'`"
+  curl -s -X PATCH \
+    https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID} \
+    -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    --data "{\"content\": \"${VALUE}\", \"ttl\": \"${TTL}\", \"comment\": \"${COMMENT}\"}"
+}
+#}}}
+
+_auto_update() { #{{{
+  local ZONE_ID="$1"
+  local DOMAIN="$2"
+  local TYPE="$3"
+  local TTL="$4"
+
+  local IP=`_show_ip SILENT`
+  [[ ! "$IP" ]] && IP='(empty result)'
+  _validate_ip "$IP" || __error_end "Invalid address. : $IP"
+
+  _update "${ZONE_ID}" "${DOMAIN}" "${TYPE}" "${IP}" "${TTL}"
+}
+#}}}
+
+_show_ip() { #{{{
+  local SILENT="$1"
+  if [[ ! "${IP_SUPPLIER_SCRIPT}" ]]; then
+    __error_end "IP_SUPPLIER_SCRIPT is not specified."
+  fi
+  local SCRIPT=(${IP_SUPPLIER_SCRIPT})
+  if ! which "${SCRIPT[0]}" > /dev/null 2>&1; then
+    if [[ ! -x "${SCRIPT[0]}" ]]; then
+      __error_end "${SCRIPT[0]} is not executable."
+    fi
+  fi
+  local DELAY=(5 10 20 35 60 120 120)
+  local CNT=0
+
+  while [[ $CNT -lt ${#DELAY[@]} ]]; do
+    # execute it
+    local IP=`${SCRIPT[@]}`
+
+    # validate it
+    if _validate_ip "$IP"; then
+      echo "${IP}"
+      return
+    else
+      # retry after sleep
+      echo "Invalid IP address, retry after ${DELAY[$CNT]}sec... : $IP" >&2
+      sleep ${DELAY[$CNT]}
+      CNT=$(($CNT + 1))
+    fi
+  done
+
+  if [[ ! "$SILENT" ]]; then
+    __error_end "Couldn't get IP address. (Executed: ${IP_SUPPLIER_SCRIPT} Result:$IP)"
+  fi
+}
+#}}}
+
+_validate_ip() { #{{{
+  local IP="$1"
+  [[ -z "$IP" || "$IP" = "0.0.0.0" || `wc -l <<<"$IP"` -gt 1 ]] && return 1
+  local REGEX='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'
+  [[ -n `sed -nre "/${REGEX}/p" <<<"$IP"` ]] && return 0 || return 1
+}
+#}}}
+
+#-------------------------------------------------------------------------------
+#- Main process ----------------------------------------------------------------
+#-------------------------------------------------------------------------------
+tty -s && __setupcolor
+
+#- Check dependencies ----------------------------------------------------------
+#{{{
+# jq
+if ! which $JQ > /dev/null 2>&1; then
+  for C in ${JQ_PATH[@]}; do
+    if [[ -x $C ]]; then
+      JQ=$C
+      break;
+    fi
+  done
+  [[ -x $JQ ]] || __error_end "jq executalbe is not found in ${JQ_PATH[*]}."
+fi
+#}}}
+
+#- Get subcommand --------------------------------------------------------------
+#{{{
+CMD="$1"
+case "$CMD" in
+  get) ;;
+  update) ;;
+  auto-update) ;;
+  show-ip) ;;
+  -h|help) _usage ;;
+  *) _usage "Unknown sub command" ;;
+esac
+shift 1
+#}}}
+
+#- Get options -----------------------------------------------------------------
+#{{{
+while getopts z:n:t:l:v:Vh OPT; do
+  case "$OPT" in
+    z) ZONE_ID=$OPTARG
+      ;;
+    n) NAME=$OPTARG
+      ;;
+    t) TYPE=$OPTARG
+      ;;
+    l) TTL=$OPTARG
+      ;;
+    v) VALUE=$OPTARG
+      ;;
+    V) VERBOSE=yes
+      ;;
+    h|\?) _usage
+      ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+#}}}
+
+#- Check options ---------------------------------------------------------------
+#{{{
+# load configuration
+for F in "${RC_FILES[@]}"; do
+  if [[ -f "$F" ]]; then
+    source "$F"
+    [[ "${VERBOSE}" == 'yes' ]] && echo "$F loaded."
+    break
+  fi
+done
+
+[[ ! "$ZONE_ID" ]] && _usage "ZONE_ID is not given."
+[[ ! "$CLOUDFLARE_API_TOKEN" ]] && _usage "CLOUDFLARE_API_TOKEN is not given."
+#}}}
+
+#- Main process ----------------------------------------------------------------
+[[ $VERBOSE ]] && echo "Hosted zone id: $ZONE_ID"
+
+case $CMD in
+  get)
+    _get_record "${ZONE_ID}" "${NAME}" "${TYPE}"
+    ;;
+  update)
+    _update "${ZONE_ID}" "${NAME}" "${TYPE}" "${VALUE}" "${TTL}"
+    ;;
+  auto-update)
+    _auto_update "${ZONE_ID}" "${NAME}" "${TYPE}" "${TTL}"
+    ;;
+  show-ip)
+    _show_ip
+    ;;
+esac
+
+# vim: ts=2 sw=2 sts=2 et nu foldmethod=marker
