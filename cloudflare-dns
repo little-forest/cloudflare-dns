@@ -87,7 +87,7 @@ __show_error() { #{{{
   if [[ -z "$MSG" ]]; then
     MSG=`sed -re '/^[ \t]*$/d' | tr -d "\n"`
   fi
-  tty -s || __syslog "[ERROR] $MSG" 'error'
+  tty -s || echo "[ERROR] $MSG" >&2
   echo -e "[${C_RED}ERROR${C_OFF}] $MSG"
 }
 #}}}
