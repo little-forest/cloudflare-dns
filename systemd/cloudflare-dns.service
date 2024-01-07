@@ -3,5 +3,5 @@ Description=This service automatically update Cloudflare DNS
 
 [Service]
 Type=oneshot
-ExecStart=/opt/cloudflare-dns/cloudflare-dns -s -u
+ExecStart=/opt/cloudflare-dns/dns-update -s -u
 
