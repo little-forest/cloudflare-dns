@@ -1,0 +1,6 @@
+[Unit]
+Description=Notify current home IP address
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cloudflare-dns/dns-update -c /etc/dns-update.conf
