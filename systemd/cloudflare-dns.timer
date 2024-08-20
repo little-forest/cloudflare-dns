@@ -1,10 +1,9 @@
 [Unit]
-Description=This is the timer to set the schedule for dns-update
+Description=Check and update the Cloudflare DNS record
 
 [Timer]
 OnCalendar=*:0/5
-Persistent=true
+Persistent=false
 
 [Install]
 WantedBy=timers.target
-
