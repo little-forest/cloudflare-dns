@@ -129,6 +129,8 @@ eval `_safe_load_config "$_CONF_FILE"`
 DNS_PUBLISHED_IP=`dig @${_DNS_SERVER} ${_DOMAIN} a | sed -nre '/;; ANSWER SECTION:/{n;s/.+[[:blank:]]+([0-9\.]+)$/\1/;p;Q;}'`
 CURRENT_IP=`${_IP_PROVIDER_SCRIPT[@]}`
 
+[[ -z "$CURRENT_IP" ]] && __error_end "Current IP address is empty."
+
 [[ "$CURRENT_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] \
   || __error_end "Couldn't get current IP address. : ${CURRENT_IP}"
 
