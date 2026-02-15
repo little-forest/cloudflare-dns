@@ -152,7 +152,7 @@ _usage() {
 	          -n : DNS record name (ex: example.com)
 	          -t : DNS record type (ex: A, CNAME, TXT, ...)
 	          -v : DNS record value
-            -l : TTL to set (optional)
+	          -l : TTL to set (optional)
 	          -V : Verbode mode
 	          -h : display usage
 	
@@ -239,7 +239,7 @@ _update() { #{{{
     https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID} \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-    --data "{\"content\": \"${VALUE}\", \"ttl\": \"${TTL}\", \"comment\": \"${COMMENT}\"}"
+    --data "{\"content\": \"${VALUE}\", \"ttl\": ${TTL}, \"comment\": \"${COMMENT}\"}"
 }
 #}}}
 
