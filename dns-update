@@ -7,17 +7,17 @@
 
 #-------------------------------------------------------------------------------
 #- common global variables -----------------------------------------------------
-__SCRIPT_BASE=`echo $(cd $(dirname $0); pwd)`
-__SCRIPT_NAME=`basename $0`
-
-__DRY_RUN=
+__SCRIPT_BASE=$(cd "$(dirname "$0")" && pwd)
+__SCRIPT_NAME=$(basename "$0")
 
 #-------------------------------------------------------------------------------
 #- global variables ------------------------------------------------------------
-_CONF_FILE=/etc/dns-update.conf
-_DOMAIN=
-_SLACK_USER=`hostname`
-_SLACK_ICON=":ghost:"
+_RC_FNAME="cloudflare-dns.conf"
+# same search order as cloudflare-dns
+_RC_FILES=("./${_RC_FNAME}" "${HOME}/.${_RC_FNAME}" "/etc/${_RC_FNAME}")
+_CONF_FILE=
+_SLACK_LOADED=
+_T_ERR=
 
 #-------------------------------------------------------------------------------
 #- common functions ------------------------------------------------------------
@@ -37,140 +37,175 @@ __error_end() { #{{{
 #-------------------------------------------------------------------------------
 #- functions -------------------------------------------------------------------
 
-_safe_load_config() { #{{{
+# read only SLACK_* variables from the config file (sourced in a subshell)
+_load_slack_config() { #{{{
   local CONF="$1"
-  [[ ! -f "$CONF" ]] && return 1
- 
-  local READ_VARS=(DOMAIN IP_PROVIDER_SCRIPT SLACK_WEBHOOK_URL SLACK_CHANNEL SLACK_USER)
-  source $CONF
- 
-  local VALUE NUM
-  for NAME in ${READ_VARS[@]}; do
-    if [[ -v $NAME ]]; then
-      VALUE=$(eval "echo \${${NAME}[@]}")
- 
-      # check if variable is an array
-      NUM=$(eval "echo \${#${NAME}[*]}")
-      if [[ $NUM -eq 1 ]]; then
-        echo "_${NAME}=\"${VALUE}\""
-      else
-        # for array
-        echo "_${NAME}=(${VALUE[@]})"
-      fi
+  local F
+
+  if [[ -n "$CONF" ]]; then
+    if [[ ! -f "$CONF" ]]; then
+      __show_error "Config file is not found. : $CONF"
+      exit 2
     fi
-  done
+  else
+    for F in "${_RC_FILES[@]}"; do
+      if [[ -f "$F" ]]; then
+        CONF="$F"
+        break
+      fi
+    done
+  fi
+  [[ -z "$CONF" ]] && return 0
+  _CONF_FILE="$CONF"
+
+  eval "$(
+    # shellcheck source=/dev/null
+    source "$CONF" > /dev/null 2>&1
+    for V in SLACK_WEBHOOK_URL SLACK_CHANNEL SLACK_USER SLACK_ICON; do
+      [[ -n "${!V}" ]] && printf '_%s=%q\n' "$V" "${!V}"
+    done
+  )"
+  [[ -z "$_SLACK_USER" ]] && _SLACK_USER=$(hostname)
+  [[ -z "$_SLACK_ICON" ]] && _SLACK_ICON=":ghost:"
+  _SLACK_LOADED=yes
+}
+#}}}
+
+# build a Slack message from the result JSON of "cloudflare-dns sync -o json"
+# print nothing if there is no need to send
+_build_message() { #{{{
+  jq -r --arg silent "$_SILENT" '
+    def count($s): [.results[] | select(.status == $s)] | length;
+    def line:
+      if .status == "updated" then "✅ `\(.name)` : `\(.before.content)` → `\(.after.content)`"
+      elif .status == "planned" then "🔜 `\(.name)` : `\(.before.content)` → `\(.after.content)`"
+      elif .status == "unchanged" then "➖ `\(.name)` : `\(.after.content)`"
+      else "❌ `\(.name)` : \(.error)" end;
+    . as $all
+    | "Current IP : `\(.value)`" as $ip
+    | if count("failed") > 0 then
+        "<!channel> Failed to update some DNS records!"
+      elif count("updated") > 0 then
+        "<!channel> IP address has been changed!"
+      elif count("planned") > 0 then
+        "<!channel> IP address has been changed! (not updated)"
+      else null end
+    | if . == null then
+        (if $silent == "" then $ip else empty end)
+      else
+        ([., $ip] + [$all.results[] | line]) | join("\n")
+      end
+  ' <<<"$1"
 }
 #}}}
 
 _send_slack() { #{{{
   local MSG="$1"
-  [[ -z "$_SLACK_WEBHOOK_URL" ]] && return 1
-  curl -s -X POST --data-urlencode "payload={\"channel\": \"${_SLACK_CHANNEL}\", \"username\": \"${_SLACK_USER}\", \"text\": \"${MSG}\", \"icon_emoji\": \"${_SLACK_ICON}\"}" ${_SLACK_WEBHOOK_URL} > /dev/null
+  [[ -z "$_SLACK_WEBHOOK_URL" ]] && return 0
+  local PAYLOAD
+  PAYLOAD=$(jq -cn --arg text "$MSG" --arg channel "$_SLACK_CHANNEL" \
+    --arg username "$_SLACK_USER" --arg icon "$_SLACK_ICON" \
+    '{text: $text, username: $username, icon_emoji: $icon}
+       + (if $channel == "" then {} else {channel: $channel} end)')
+  curl -sS -X POST -H 'Content-Type: application/json' --data "$PAYLOAD" \
+    "$_SLACK_WEBHOOK_URL" > /dev/null \
+    || __show_error "Failed to send a message to Slack."
+}
+#}}}
+
+# report a fatal error to stderr and Slack, then exit (default exit code: 1)
+# DETAIL is appended only to the Slack message
+_fatal() { #{{{
+  local MSG="$1"
+  local RC="${2:-1}"
+  local DETAIL="$3"
+  __show_error "$MSG"
+  if [[ -n "$_SLACK_LOADED" ]]; then
+    local TEXT="<!channel> ${__SCRIPT_NAME} failed!"$'\n'"${MSG}"
+    [[ -n "$DETAIL" ]] && TEXT+=$'\n```\n'"${DETAIL}"$'\n```'
+    _send_slack "$TEXT"
+  fi
+  exit "$RC"
+}
+#}}}
+
+# shellcheck disable=SC2329 # invoked by trap
+_cleanup() { #{{{
+  [[ -n "$_T_ERR" ]] && rm -f "$_T_ERR"
 }
 #}}}
 
 _usage() { #{{{
   [[ "$1" ]] && __show_error "$1"
   cat <<!!!
-usage : $__SCRIPT_NAME [-c CONF_FILE] [-d DOMAIN_NAME] [-u] [-s] [-h]
-          -c : specify config file path (default: $_CONF_FILE)
-          -d : specify target domain name
-          -u : update dns record when ip address changing is detected
-          -s : be silent unless ip address is changed 
+usage : $__SCRIPT_NAME [-c CONF_FILE] [-u] [-s] [-h]
+          -c : config file path (passed through to cloudflare-dns)
+               (default: the first one found in ${_RC_FILES[*]})
+          -u : update records (without -u: check only = cloudflare-dns sync -N)
+          -s : silent on Slack unless something changed or failed
           -h : display usage
 
-[Configuration format]
+[Configuration]
+  Records and IP_COMMAND are read by cloudflare-dns from the same config file.
+  This script reads only the following variables.
 
-  DOMAIN             : Target domain
-  IP_PROVIDER_SCRIPT : Script path which provides current IP address
-                         example: IP_PROVIDER_SCRIPT=(curl -s https://xxxxxx)
-  SLACK_WEBHOOK_URL  : Slack web hook url to send notification
+  SLACK_WEBHOOK_URL  : Slack web hook url to send notification (no notification if empty)
   SLACK_CHANNEL      : Slack channel to notify (Should start with '#')
+  SLACK_USER         : Slack user name (default: hostname)
+  SLACK_ICON         : Slack icon emoji (default: :ghost:)
 !!!
-  exit 1
+  [[ "$1" ]] && exit 2
+  exit 0
 }
 #}}}
 
 #-------------------------------------------------------------------------------
 #- Main process ----------------------------------------------------------------
 #-------------------------------------------------------------------------------
+trap _cleanup EXIT
 
 #- Get options -----------------------------------------------------------------
 #{{{
-while getopts c:d:ush OPT; do
+while getopts c:ush OPT; do
   case "$OPT" in
-    c) _CONF_FILE="$OPTARG"
-      ;;
-    d) _DOMAIN_OPT="$OPTARG"
+    c) _CONF_OPT="$OPTARG"
       ;;
     u) _UPDATE_DNS=yes
       ;;
     s) _SILENT=yes
       ;;
-    h|\?) _usage
+    h) _usage
+      ;;
+    \?) _usage "Invalid option."
       ;;
   esac
 done
-shift `expr $OPTIND - 1`
+shift $((OPTIND - 1))
 #}}}
 
-eval `_safe_load_config "$_CONF_FILE"`
-
-[[ -n ${_DOMAIN_OPT} ]] && _DOMAIN="${_DOMAIN_OPT}"
-
-#- Check options ---------------------------------------------------------------
-#{{{
-[[ -z "${_DOMAIN}" ]] && __error_end "Domain name is not specified."
-#}}}
+# errors before loading SLACK_* are reported only to stderr
+command -v jq > /dev/null 2>&1 || __error_end "jq executable is not found."
+_load_slack_config "$_CONF_OPT"
 
 #- Main process ----------------------------------------------------------------
 CF_DNS="${__SCRIPT_BASE}/cloudflare-dns"
-[[ ! -x "$CF_DNS" ]] && __error_end "cloudflare-dns executable is not found. : $CF_DNS"
+[[ -x "$CF_DNS" ]] || _fatal "cloudflare-dns executable is not found. : $CF_DNS"
 
-# get registered IP address from Cloudflare (not from public DNS cache)
-CF_RECORD=`$CF_DNS get -t A -n ${_DOMAIN}` \
-  || __error_end "Couldn't get DNS record from Cloudflare. : ${_DOMAIN}"
-CF_RECORD_IP=`jq -rs '.[0].content // empty' <<<"$CF_RECORD"`
-[[ -z "$CF_RECORD_IP" ]] && __error_end "DNS record is not found in Cloudflare. : ${_DOMAIN}"
+CF_OPTS=(sync -o json)
+[[ -n "$_CONF_FILE" ]] && CF_OPTS+=(-c "$_CONF_FILE")
+[[ "$_UPDATE_DNS" != yes ]] && CF_OPTS+=(-N)
 
-CURRENT_IP=`${_IP_PROVIDER_SCRIPT[@]}`
+_T_ERR=$(mktemp) || _fatal "Failed to create a temporary file."
+OUT=$("$CF_DNS" "${CF_OPTS[@]}" 2>"$_T_ERR"); RC=$?
+cat "$_T_ERR" >&2
 
-[[ -z "$CURRENT_IP" ]] && __error_end "Current IP address is empty."
-
-[[ "$CURRENT_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] \
-  || __error_end "Couldn't get current IP address. : ${CURRENT_IP}"
-
-MSG="Current IP : \`${CURRENT_IP}\`"
-
-# Check DNS
-if [[ "${CURRENT_IP}" != "${CF_RECORD_IP}" ]]; then
-  MSG=$(cat <<!!!
-<!channel> IP address has been changed!
-${MSG}
-\`${_DOMAIN}\` : \`${CF_RECORD_IP}\`
-!!!
-)
-else
-  # ip address is not changed
-  if [[ "$_SILENT" != yes ]]; then
-    _send_slack "$MSG"
-  fi
-  exit 0
+if ! jq -e '.results | type == "array"' <<<"$OUT" > /dev/null 2>&1; then
+  _fatal "cloudflare-dns exited without a result. (exit code: $RC)" \
+    $((RC ? RC : 1)) "$(tail -n 20 "$_T_ERR")"
 fi
 
-# Send slack
-_send_slack "$MSG"
-
-# Update DNS
-if [[ "$_UPDATE_DNS" == yes ]]; then
-  _send_slack "Updating DNS record..."
-  $CF_DNS update -t A -n $_DOMAIN -v $CURRENT_IP
-  RESULT=$?
-  if [[ $RESULT -eq 0 ]]; then
-    _send_slack "Success!!"
-  else
-    _send_slack "Failed!!"
-  fi
-fi
+MSG=$(_build_message "$OUT")
+[[ -n "$MSG" ]] && _send_slack "$MSG"
+exit $RC
 
 # vim: ts=2 sw=2 sts=2 et nu foldmethod=marker
