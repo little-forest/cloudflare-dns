@@ -72,7 +72,7 @@ _send_slack() { #{{{
 _usage() { #{{{
   [[ "$1" ]] && __show_error "$1"
   cat <<!!!
-usege : $__SCRIPT_NAME [-c CONF_FILE] [-d DOMAIN_NAME] [-u] [-s] [-h]
+usage : $__SCRIPT_NAME [-c CONF_FILE] [-d DOMAIN_NAME] [-u] [-s] [-h]
           -c : specify config file path (default: $_CONF_FILE)
           -d : specify target domain name
           -u : update dns record when ip address changing is detected
@@ -82,10 +82,10 @@ usege : $__SCRIPT_NAME [-c CONF_FILE] [-d DOMAIN_NAME] [-u] [-s] [-h]
 [Configuration format]
 
   DOMAIN             : Target domain
-  IP_PROVIDER_SCRIPT : Scripth path which provides current IP address
+  IP_PROVIDER_SCRIPT : Script path which provides current IP address
                          example: IP_PROVIDER_SCRIPT=(curl -s https://xxxxxx)
   SLACK_WEBHOOK_URL  : Slack web hook url to send notification
-  SLACK_CHANNEL      : Slack channel to notify (Should to be started with '#')
+  SLACK_CHANNEL      : Slack channel to notify (Should start with '#')
 !!!
   exit 1
 }

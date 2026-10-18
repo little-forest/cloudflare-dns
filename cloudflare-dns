@@ -26,7 +26,7 @@ __setupcolor() { #{{{
   ESC="\e["
   ESCEND=m
 
-  # define empty valiable
+  # define empty variable
   for C in ${STYLE[@]}; do
     eval "C_${C}="
   done
@@ -142,7 +142,7 @@ _usage() {
   [[ -n "$1" ]] && __show_error "$1"
   ( ! tty -s || [[ -n "$1" ]] ) && echo "ERROR: $1" >&2
   cat <<- EOM
-	${C_WHITE}Usege:${C_OFF}
+	${C_WHITE}Usage:${C_OFF}
 	  $SCRIPT_NAME (get|update|auto-update|show-ip) [-h] [-z ZONE_ID] [-n NAME] [-t TYPE] [-l TTL] [-v VALUE]
 	    get:         Get DNS record (type and name should be specified)
 	    update:      Update DNS A record
@@ -153,7 +153,7 @@ _usage() {
 	          -t : DNS record type (ex: A, CNAME, TXT, ...)
 	          -v : DNS record value
 	          -l : TTL to set (optional)
-	          -V : Verbode mode
+	          -V : Verbose mode
 	          -h : display usage
 	
 	${C_WHITE}Configuration file:${C_OFF}
@@ -170,14 +170,14 @@ _usage() {
 	  * Get all record set of specified zone.
 	      $SCRIPT_NAME get -z ZONE_ID -V
 	
-	  * Get Sepcified DNS record.
+	  * Get specified DNS record.
 	      $SCRIPT_NAME get -z ZONE_ID -t A -n example.com
 	
 	  * Update DNS A record.
 	      $SCRIPT_NAME update -z ZONE_ID -t A -n example.com -v IP_ADDRESS
 	
 	  * Auto-Update DNS A record.
-	      (IP address is auto-accuired using IP_SUPPLIER_SCRIPT specified in ${RC_FNAME})
+	      (IP address is auto-acquired using IP_SUPPLIER_SCRIPT specified in ${RC_FNAME})
 	      $SCRIPT_NAME auto-update -z ZONE_ID -t A -n example.com
 	EOM
   exit 1
@@ -323,7 +323,7 @@ if ! which $JQ > /dev/null 2>&1; then
       break;
     fi
   done
-  [[ -x $JQ ]] || __error_end "jq executalbe is not found in ${JQ_PATH[*]}."
+  [[ -x $JQ ]] || __error_end "jq executable is not found in ${JQ_PATH[*]}."
 fi
 #}}}
 

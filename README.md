@@ -13,7 +13,7 @@
           -t : DNS record type (ex: A, CNAME, TXT, ...)
           -v : DNS record value
             -l : TTL to set (optional)
-          -V : Verbode mode
+          -V : Verbose mode
           -h : display usage
 ```
 
@@ -35,14 +35,14 @@ If both files are specified, `./cloudflare-dns.conf` will take precedence.
 * Get all record set of specified zone.
   `cloudflare-dns get -z ZONE_ID -V`
 
-* Get Sepcified DNS record.
+* Get specified DNS record.
   `cloudflare-dns get -z ZONE_ID -t A -n example.com`
 
 * Update DNS A record.
   `cloudflare-dns update -z ZONE_ID -t A -n example.com -v IP_ADDRESS`
 
 * Auto-Update DNS A record.
-  (IP address is auto-accuired using IP_SUPPLIER_SCRIPT specified in cloudflare-dns.conf)
+  (IP address is auto-acquired using IP_SUPPLIER_SCRIPT specified in cloudflare-dns.conf)
   `cloudflare-dns auto-update -z ZONE_ID -t A -n example.com`
 
 ## Installing systemd unit files
