@@ -26,7 +26,7 @@ __setupcolor() { #{{{
   ESC="\e["
   ESCEND=m
 
-  # define empty valiable
+  # define empty variable
   for C in ${STYLE[@]}; do
     eval "C_${C}="
   done
@@ -142,7 +142,7 @@ _usage() {
   [[ -n "$1" ]] && __show_error "$1"
   ( ! tty -s || [[ -n "$1" ]] ) && echo "ERROR: $1" >&2
   cat <<- EOM
-	${C_WHITE}Usege:${C_OFF}
+	${C_WHITE}Usage:${C_OFF}
 	  $SCRIPT_NAME (get|update|auto-update|show-ip) [-h] [-z ZONE_ID] [-n NAME] [-t TYPE] [-l TTL] [-v VALUE]
 	    get:         Get DNS record (type and name should be specified)
 	    update:      Update DNS A record
@@ -153,7 +153,7 @@ _usage() {
 	          -t : DNS record type (ex: A, CNAME, TXT, ...)
 	          -v : DNS record value
 	          -l : TTL to set (optional)
-	          -V : Verbode mode
+	          -V : Verbose mode
 	          -h : display usage
 	
 	${C_WHITE}Configuration file:${C_OFF}
@@ -170,14 +170,14 @@ _usage() {
 	  * Get all record set of specified zone.
 	      $SCRIPT_NAME get -z ZONE_ID -V
 	
-	  * Get Sepcified DNS record.
+	  * Get specified DNS record.
 	      $SCRIPT_NAME get -z ZONE_ID -t A -n example.com
 	
 	  * Update DNS A record.
 	      $SCRIPT_NAME update -z ZONE_ID -t A -n example.com -v IP_ADDRESS
 	
 	  * Auto-Update DNS A record.
-	      (IP address is auto-accuired using IP_SUPPLIER_SCRIPT specified in ${RC_FNAME})
+	      (IP address is auto-acquired using IP_SUPPLIER_SCRIPT specified in ${RC_FNAME})
 	      $SCRIPT_NAME auto-update -z ZONE_ID -t A -n example.com
 	EOM
   exit 1
@@ -235,11 +235,18 @@ _update() { #{{{
   [[ "${CHANGED}" != 'yes' ]] && return
 
   local COMMENT="Updated by ${SCRIPT_NAME} at `date '+%Y-%m-%dT%H:%M:%S%z'`"
+  local T_RESPONSE=`__make_tmp`
   curl -s -X PATCH \
     https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID} \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-    --data "{\"content\": \"${VALUE}\", \"ttl\": ${TTL}, \"comment\": \"${COMMENT}\"}"
+    --data "{\"content\": \"${VALUE}\", \"ttl\": ${TTL}, \"comment\": \"${COMMENT}\"}" \
+    > ${T_RESPONSE} || __error_end "Failed to call Cloudflare API : ${DOMAIN} ${TYPE}"
+  cat ${T_RESPONSE}
+
+  # check API result
+  [[ `jq -r '.success' ${T_RESPONSE} 2>/dev/null` == 'true' ]] \
+    || __error_end "Failed to update record : ${DOMAIN} ${TYPE} : `jq -c '.errors' ${T_RESPONSE} 2>/dev/null`"
 }
 #}}}
 
@@ -316,7 +323,7 @@ if ! which $JQ > /dev/null 2>&1; then
       break;
     fi
   done
-  [[ -x $JQ ]] || __error_end "jq executalbe is not found in ${JQ_PATH[*]}."
+  [[ -x $JQ ]] || __error_end "jq executable is not found in ${JQ_PATH[*]}."
 fi
 #}}}
 
@@ -332,6 +339,18 @@ case "$CMD" in
   *) _usage "Unknown sub command" ;;
 esac
 shift 1
+#}}}
+
+#- Load configuration ----------------------------------------------------------
+#{{{
+# load before parsing options so that command line options take precedence
+for F in "${RC_FILES[@]}"; do
+  if [[ -f "$F" ]]; then
+    source "$F"
+    LOADED_RC="$F"
+    break
+  fi
+done
 #}}}
 
 #- Get options -----------------------------------------------------------------
@@ -359,14 +378,7 @@ shift `expr $OPTIND - 1`
 
 #- Check options ---------------------------------------------------------------
 #{{{
-# load configuration
-for F in "${RC_FILES[@]}"; do
-  if [[ -f "$F" ]]; then
-    source "$F"
-    [[ "${VERBOSE}" == 'yes' ]] && echo "$F loaded."
-    break
-  fi
-done
+[[ "${VERBOSE}" == 'yes' && -n "${LOADED_RC}" ]] && echo "${LOADED_RC} loaded."
 
 [[ ! "$ZONE_ID" ]] && _usage "ZONE_ID is not given."
 [[ ! "$CLOUDFLARE_API_TOKEN" ]] && _usage "CLOUDFLARE_API_TOKEN is not given."
