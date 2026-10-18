@@ -235,11 +235,18 @@ _update() { #{{{
   [[ "${CHANGED}" != 'yes' ]] && return
 
   local COMMENT="Updated by ${SCRIPT_NAME} at `date '+%Y-%m-%dT%H:%M:%S%z'`"
+  local T_RESPONSE=`__make_tmp`
   curl -s -X PATCH \
     https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID} \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-    --data "{\"content\": \"${VALUE}\", \"ttl\": ${TTL}, \"comment\": \"${COMMENT}\"}"
+    --data "{\"content\": \"${VALUE}\", \"ttl\": ${TTL}, \"comment\": \"${COMMENT}\"}" \
+    > ${T_RESPONSE} || __error_end "Failed to call Cloudflare API : ${DOMAIN} ${TYPE}"
+  cat ${T_RESPONSE}
+
+  # check API result
+  [[ `jq -r '.success' ${T_RESPONSE} 2>/dev/null` == 'true' ]] \
+    || __error_end "Failed to update record : ${DOMAIN} ${TYPE} : `jq -c '.errors' ${T_RESPONSE} 2>/dev/null`"
 }
 #}}}
 
