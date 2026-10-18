@@ -16,7 +16,6 @@ __DRY_RUN=
 #- global variables ------------------------------------------------------------
 _CONF_FILE=/etc/dns-update.conf
 _DOMAIN=
-_DNS_SERVER=8.8.8.8
 _SLACK_USER=`hostname`
 _SLACK_ICON=":ghost:"
 
@@ -42,7 +41,7 @@ _safe_load_config() { #{{{
   local CONF="$1"
   [[ ! -f "$CONF" ]] && return 1
  
-  local READ_VARS=(DOMAIN DNS_SERVER IP_PROVIDER_SCRIPT SLACK_WEBHOOK_URL SLACK_CHANNEL SLACK_USER)
+  local READ_VARS=(DOMAIN IP_PROVIDER_SCRIPT SLACK_WEBHOOK_URL SLACK_CHANNEL SLACK_USER)
   source $CONF
  
   local VALUE NUM
@@ -83,7 +82,6 @@ usege : $__SCRIPT_NAME [-c CONF_FILE] [-d DOMAIN_NAME] [-u] [-s] [-h]
 [Configuration format]
 
   DOMAIN             : Target domain
-  DNS_SERVER         : DNS server name to check DNS record (defult: ${_DNS_SERVER})
   IP_PROVIDER_SCRIPT : Scripth path which provides current IP address
                          example: IP_PROVIDER_SCRIPT=(curl -s https://xxxxxx)
   SLACK_WEBHOOK_URL  : Slack web hook url to send notification
@@ -126,7 +124,15 @@ eval `_safe_load_config "$_CONF_FILE"`
 #}}}
 
 #- Main process ----------------------------------------------------------------
-DNS_PUBLISHED_IP=`dig @${_DNS_SERVER} ${_DOMAIN} a | sed -nre '/;; ANSWER SECTION:/{n;s/.+[[:blank:]]+([0-9\.]+)$/\1/;p;Q;}'`
+CF_DNS="${__SCRIPT_BASE}/cloudflare-dns"
+[[ ! -x "$CF_DNS" ]] && __error_end "cloudflare-dns executable is not found. : $CF_DNS"
+
+# get registered IP address from Cloudflare (not from public DNS cache)
+CF_RECORD=`$CF_DNS get -t A -n ${_DOMAIN}` \
+  || __error_end "Couldn't get DNS record from Cloudflare. : ${_DOMAIN}"
+CF_RECORD_IP=`jq -rs '.[0].content // empty' <<<"$CF_RECORD"`
+[[ -z "$CF_RECORD_IP" ]] && __error_end "DNS record is not found in Cloudflare. : ${_DOMAIN}"
+
 CURRENT_IP=`${_IP_PROVIDER_SCRIPT[@]}`
 
 [[ -z "$CURRENT_IP" ]] && __error_end "Current IP address is empty."
@@ -137,11 +143,11 @@ CURRENT_IP=`${_IP_PROVIDER_SCRIPT[@]}`
 MSG="Current IP : \`${CURRENT_IP}\`"
 
 # Check DNS
-if [[ "${CURRENT_IP}" != "${DNS_PUBLISHED_IP}" ]]; then
+if [[ "${CURRENT_IP}" != "${CF_RECORD_IP}" ]]; then
   MSG=$(cat <<!!!
 <!channel> IP address has been changed!
 ${MSG}
-\`${_DOMAIN}\` : \`${DNS_PUBLISHED_IP}\`
+\`${_DOMAIN}\` : \`${CF_RECORD_IP}\`
 !!!
 )
 else
@@ -157,8 +163,6 @@ _send_slack "$MSG"
 
 # Update DNS
 if [[ "$_UPDATE_DNS" == yes ]]; then
-  CF_DNS="${__SCRIPT_BASE}/cloudflare-dns"
-  [[ ! -x "$CF_DNS" ]] && __error_end "cloudflare-dns executable is not found. : $CF_DNS"
   _send_slack "Updating DNS record..."
   $CF_DNS update -t A -n $_DOMAIN -v $CURRENT_IP
   RESULT=$?
