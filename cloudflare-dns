@@ -148,17 +148,47 @@ _usage() {
   fi
   cat <<- EOM
 	${C_WHITE}Usage:${C_OFF}
-	  $SCRIPT_NAME <get|show-ip> [options]
-	    get:     Get DNS records as a JSON array
+	  $SCRIPT_NAME <get|update|sync|show-ip> [options]
+	    get:     Get the target records as a JSON array
+	    update:  Set VALUE (-v) to the target records
+	    sync:    Set the current IP address (IP_COMMAND) to the target records
 	    show-ip: Show the current IP address using IP_COMMAND
 
 	${C_WHITE}Options:${C_OFF}
 	  -c CONF   Config file path              (--config=CONF)
 	  -z ZONE   Cloudflare zone ID (overrides ZONE_ID)
 	  -n SPEC   Target record: NAME[:TYPE[:TTL[:PROXIED]]]  (repeatable)
+	  -v VALUE  Value to set (update only)
 	  -a        All records in the zone (get only)
+	  -N        Dry run (update/sync)         (--dry-run)
+	  -o FMT    text (default) | json  (update/sync)  (--output=FMT)
 	  -V        Verbose
 	  -h        Show usage                    (--help)
+
+	  Without -n, all records in RECORDS of the config file are targeted.
+
+	${C_WHITE}Configuration file:${C_OFF}
+	  The first one found in -c, ${RC_FILES[*]} is loaded.
+
+	      CLOUDFLARE_API_TOKEN=XXXXXXXXXXXXXXXXXXXX
+	      ZONE_ID=XXXXXXXXXXXXXXXXXXXX
+	      IP_COMMAND=(curl -s https://ifconfig.me)
+	      RECORDS=("example.com" "www.example.com:A:300" "vpn.example.com:A::false")
+
+	${C_WHITE}Exit status:${C_OFF}
+	  0: all records are unchanged, updated or planned
+	  1: some records failed, or the IP address could not be acquired
+	  2: usage or configuration error (no API is called)
+
+	${C_WHITE}Example:${C_OFF}
+	  * Show all records in RECORDS.
+	      $SCRIPT_NAME get
+
+	  * Show changes without updating.
+	      $SCRIPT_NAME sync -N
+
+	  * Update a record which is not in RECORDS.
+	      $SCRIPT_NAME update -n other.example.com:A:auto -v 203.0.113.5
 	EOM
   exit 0
 }
@@ -409,6 +439,95 @@ _get_records() { #{{{
 }
 #}}}
 
+# sync a single record to VALUE, then print the result as a JSON line
+_sync_one() { #{{{
+  local SPEC="$1"
+  local VALUE="$2"
+  local NAME TYPE TTL PROXIED BEFORE AFTER BODY COMMENT
+  IFS=: read -r NAME TYPE TTL PROXIED <<<"$SPEC"
+
+  _emit() {
+    jq -cn --arg name "$NAME" --arg type "$TYPE" --arg status "$1" \
+      --argjson before "${2:-null}" --argjson after "${3:-null}" --arg error "$4" \
+      '{name: $name, type: $type, status: $status, before: $before, after: $after,
+        error: (if $error == "" then null else $error end)}'
+  }
+
+  if ! _find_record "$NAME" "$TYPE"; then
+    _emit failed '' '' "$FIND_ERROR"; return
+  fi
+
+  BEFORE=$(jq -c '{content, ttl, proxied}' <<<"$REC")
+  AFTER=$(jq -c --arg content "$VALUE" --arg ttl "$TTL" --arg proxied "$PROXIED" \
+    '. + {content: $content}
+       + (if $ttl == "" then {} else {ttl: ($ttl | tonumber)} end)
+       + (if $proxied == "" then {} else {proxied: ($proxied == "true")} end)' <<<"$BEFORE")
+
+  if [[ $(jq -n --argjson a "$BEFORE" --argjson b "$AFTER" '$a == $b') == true ]]; then
+    _emit unchanged "$BEFORE" "$AFTER"; return
+  fi
+  if [[ -n "$DRY_RUN" ]]; then
+    _emit planned "$BEFORE" "$AFTER"; return
+  fi
+
+  COMMENT="Updated by ${SCRIPT_NAME} at $(date '+%Y-%m-%dT%H:%M:%S%z')"
+  BODY=$(jq -c --arg comment "$COMMENT" '. + {comment: $comment}' <<<"$AFTER")
+  local ID
+  ID=$(jq -r '.id' <<<"$REC")
+  if _cf_api PATCH "/zones/${ZONE_ID}/dns_records/${ID}" "$BODY"; then
+    _emit updated "$BEFORE" "$(jq -c '.result | {content, ttl, proxied}' <<<"$CF_RESP")"
+  else
+    _emit failed "$BEFORE" '' "$CF_ERROR"
+  fi
+}
+#}}}
+
+# sync all TARGETS to VALUE and print the results. return 1 if any of them failed
+_sync_all() { #{{{
+  local VALUE="$1"
+  local T RESULTS='' ALL
+  for T in "${TARGETS[@]}"; do
+    RESULTS+="$(_sync_one "$T" "$VALUE")"$'\n'
+  done
+  ALL=$(printf '%s' "$RESULTS" | jq -cs --arg value "$VALUE" --arg dry "$DRY_RUN" \
+    '{value: $value, dry_run: ($dry != ""), results: .}')
+
+  if [[ "$OUTPUT" == json ]]; then
+    _print_json "$ALL"
+  else
+    _print_text "$ALL"
+  fi
+  [[ $(jq '[.results[] | select(.status == "failed")] | length' <<<"$ALL") == 0 ]]
+}
+#}}}
+
+_print_json() { #{{{
+  jq . <<<"$1"
+}
+#}}}
+
+_print_text() { #{{{
+  local LABEL="Value"
+  [[ "$CMD" == sync ]] && LABEL="Current IP"
+  jq -r --arg label "$LABEL" '
+    def pad($n): . + (" " * ($n - length));
+    def change($k): if .before[$k] == .after[$k] then empty
+      else " \($k) \(.before[$k]) -> \(.after[$k])" end;
+    (.results | map(.name | length) | max) as $w
+    | "\($label): \(.value)" + (if .dry_run then " (dry run)" else "" end),
+      (.results[]
+        | "  " + (.status | pad(10)) + " " + (.name | pad($w)) + "  " + .type + "  "
+          + (if .status == "failed" then .error
+             elif .status == "unchanged" then .after.content
+             else "\(.before.content) -> \(.after.content)"
+               + ([change("ttl"), change("proxied")] | if length > 0 then " (" + (join(",") | ltrimstr(" ")) + ")" else "" end)
+             end)),
+      ([.results | group_by(.status)[] | {key: .[0].status, value: length}] | from_entries) as $c
+      | [("updated", "planned", "unchanged", "failed") | select($c[.]) | "\($c[.]) \(.)"] | join(", ")
+  ' <<<"$1"
+}
+#}}}
+
 # print the current IP address using IP_COMMAND (with retry)
 _get_ip() { #{{{
   if [[ ${#IP_COMMAND[@]} -eq 0 ]]; then
@@ -470,6 +589,8 @@ set -- "${ARGS[@]}"
 CMD="$1"
 case "$CMD" in
   get) ;;
+  update) ;;
+  sync) ;;
   show-ip) ;;
   -h|help) _usage ;;
   '') _usage "Sub command is not specified." ;;
@@ -482,7 +603,8 @@ shift 1
 #{{{
 # options are applied after loading the config so that they take precedence
 NAME_OPTS=()
-while getopts c:z:n:aVh OPT; do
+OUTPUT=text
+while getopts c:z:n:v:aNo:Vh OPT; do
   case "$OPT" in
     c) OPT_CONF=$OPTARG
       ;;
@@ -490,7 +612,13 @@ while getopts c:z:n:aVh OPT; do
       ;;
     n) NAME_OPTS+=("$OPTARG")
       ;;
+    v) VALUE=$OPTARG
+      ;;
     a) ALL_RECORDS=yes
+      ;;
+    N) DRY_RUN=yes
+      ;;
+    o) OUTPUT=$OPTARG
       ;;
     V) VERBOSE=yes
       ;;
@@ -517,6 +645,13 @@ if [[ "$CMD" != show-ip ]]; then
 fi
 [[ -n "$ALL_RECORDS" && "$CMD" != get ]] && _usage "-a is available only for get."
 [[ -n "$ALL_RECORDS" && ${#NAME_OPTS[@]} -gt 0 ]] && _usage "-a and -n cannot be used together."
+[[ -n "$DRY_RUN" && "$CMD" != update && "$CMD" != sync ]] && _usage "-N is available only for update and sync."
+[[ "$OUTPUT" != text && "$OUTPUT" != json ]] && _usage "Invalid output format : $OUTPUT"
+[[ -n "$VALUE" && "$CMD" != update ]] && _usage "-v is available only for update."
+if [[ "$CMD" == update ]]; then
+  [[ -z "$VALUE" ]] && _usage "Value is not specified."
+  _validate_ipv4 "$VALUE" || _usage "Invalid IPv4 address : $VALUE"
+fi
 
 if [[ "$CMD" != show-ip && -z "$ALL_RECORDS" ]]; then
   _collect_targets
@@ -531,6 +666,13 @@ case $CMD in
     else
       _get_records
     fi
+    ;;
+  update)
+    _sync_all "$VALUE"
+    ;;
+  sync)
+    VALUE=$(_get_ip) || exit $?
+    _sync_all "$VALUE"
     ;;
   show-ip)
     _get_ip
