@@ -66,7 +66,7 @@ _safe_load_config() { #{{{
 _send_slack() { #{{{
   local MSG="$1"
   [[ -z "$_SLACK_WEBHOOK_URL" ]] && return 1
-  curl -s -X POST --data-urlencode "payload={\"channel\": \"${SLACK_CHANNEL}\", \"username\": \"${_SLACK_USER}\", \"text\": \"${MSG}\", \"icon_emoji\": \"${_SLACK_ICON}\"}" ${_SLACK_WEBHOOK_URL} > /dev/null
+  curl -s -X POST --data-urlencode "payload={\"channel\": \"${_SLACK_CHANNEL}\", \"username\": \"${_SLACK_USER}\", \"text\": \"${MSG}\", \"icon_emoji\": \"${_SLACK_ICON}\"}" ${_SLACK_WEBHOOK_URL} > /dev/null
 }
 #}}}
 
