@@ -341,6 +341,18 @@ esac
 shift 1
 #}}}
 
+#- Load configuration ----------------------------------------------------------
+#{{{
+# load before parsing options so that command line options take precedence
+for F in "${RC_FILES[@]}"; do
+  if [[ -f "$F" ]]; then
+    source "$F"
+    LOADED_RC="$F"
+    break
+  fi
+done
+#}}}
+
 #- Get options -----------------------------------------------------------------
 #{{{
 while getopts z:n:t:l:v:Vh OPT; do
@@ -366,14 +378,7 @@ shift `expr $OPTIND - 1`
 
 #- Check options ---------------------------------------------------------------
 #{{{
-# load configuration
-for F in "${RC_FILES[@]}"; do
-  if [[ -f "$F" ]]; then
-    source "$F"
-    [[ "${VERBOSE}" == 'yes' ]] && echo "$F loaded."
-    break
-  fi
-done
+[[ "${VERBOSE}" == 'yes' && -n "${LOADED_RC}" ]] && echo "${LOADED_RC} loaded."
 
 [[ ! "$ZONE_ID" ]] && _usage "ZONE_ID is not given."
 [[ ! "$CLOUDFLARE_API_TOKEN" ]] && _usage "CLOUDFLARE_API_TOKEN is not given."
