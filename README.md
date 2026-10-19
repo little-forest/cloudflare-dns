@@ -65,7 +65,9 @@ cloudflare-dns <get|update|sync|show-ip> [options]
   -v VALUE  Value to set (update only)
   -a        All records in the zone (get only)
   -N        Dry run (update/sync)                     (--dry-run)
-  -o FMT    text (default) | json  (update/sync)      (--output=FMT)
+  -o FMT    text (default) | json | jsonl  (update/sync)  (--output=FMT)
+            jsonl: one JSON object per record on stdout, and one JSON object
+                   per message on stderr
   --notify[=MODE]  Send the result to Slack (sync only)
             always (default): every run
             changes: only when something is updated, planned or failed
@@ -109,6 +111,32 @@ With `-o json`:
      "before": null, "after": null, "error": "record not found"}
   ]
 }
+```
+
+With `-o jsonl`, one JSON object is printed per record (one line each, no timestamp). The systemd services use this format so that the results in the journal can be filtered with `jq`.
+
+```json
+{"level":"info","currentIP":"203.0.113.5","status":"updated","record":"example.com","type":"A","oldIP":"198.51.100.1","newIP":"203.0.113.5","oldDnsProxy":true,"newDnsProxy":true,"oldTtl":1,"newTtl":1,"error":null}
+{"level":"info","currentIP":"203.0.113.5","status":"unchanged","record":"www.example.com","type":"A","oldIP":"203.0.113.5","newIP":"203.0.113.5","oldDnsProxy":false,"newDnsProxy":false,"oldTtl":300,"newTtl":300,"error":null}
+{"level":"error","currentIP":"203.0.113.5","status":"failed","record":"missing.example.com","type":"A","oldIP":null,"newIP":null,"oldDnsProxy":null,"newDnsProxy":null,"oldTtl":null,"newTtl":null,"error":"record not found"}
+```
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `level` | string | `error` for `failed`, otherwise `info` |
+| `currentIP` | string | The IP address from `IP_COMMAND` (`sync`), or `-v VALUE` (`update`) |
+| `status` | string | `updated` / `planned` / `unchanged` / `failed` |
+| `record` | string | Record name (lowercased, without the trailing `.`) |
+| `type` | string | `A` |
+| `oldIP` / `newIP` | string \| null | `content` before / after the update (planned value for `planned`) |
+| `oldDnsProxy` / `newDnsProxy` | boolean \| null | `proxied` before / after the update |
+| `oldTtl` / `newTtl` | number \| null | `ttl` before / after the update (`1` is auto) |
+| `error` | string \| null | The reason of `failed` |
+
+All keys are always present. The `old*` and `new*` values are `null` when the record is not found, and the `new*` values are `null` when the update itself failed.
+
+```
+journalctl -u cloudflare-dns -o cat | jq -c 'select(.status == "updated")'
 ```
 
 | Exit status | Meaning |

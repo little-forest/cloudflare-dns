@@ -161,7 +161,9 @@ _usage() {
 	  -v VALUE  Value to set (update only)
 	  -a        All records in the zone (get only)
 	  -N        Dry run (update/sync)         (--dry-run)
-	  -o FMT    text (default) | json  (update/sync)  (--output=FMT)
+	  -o FMT    text (default) | json | jsonl  (update/sync)  (--output=FMT)
+	            jsonl: one JSON object per record on stdout, and one JSON object
+	                   per message on stderr
 	  --notify[=MODE]  Send the result to Slack (sync only)
 	            always (default): every run
 	            changes: only when something is updated, planned or failed
@@ -514,11 +516,11 @@ _sync_all() { #{{{
   ALL=$(printf '%s' "$RESULTS" | jq -cs --arg value "$VALUE" --arg dry "$DRY_RUN" \
     '{value: $value, dry_run: ($dry != ""), results: .}')
 
-  if [[ "$OUTPUT" == json ]]; then
-    _print_json "$ALL"
-  else
-    _print_text "$ALL"
-  fi
+  case "$OUTPUT" in
+    json)  _print_json "$ALL" ;;
+    jsonl) _print_jsonl "$ALL" ;;
+    *)     _print_text "$ALL" ;;
+  esac
 
   if [[ -n "$NOTIFY_MODE" ]]; then
     local MSG
@@ -587,6 +589,21 @@ _notify_fatal() { #{{{
 
 _print_json() { #{{{
   jq . <<<"$1"
+}
+#}}}
+
+# one line per record. a missing before/after (failed) results in null values
+_print_jsonl() { #{{{
+  jq -c '
+    .value as $ip
+    | .results[]
+    | {level: (if .status == "failed" then "error" else "info" end),
+       currentIP: $ip, status, record: .name, type,
+       oldIP: .before.content, newIP: .after.content,
+       oldDnsProxy: .before.proxied, newDnsProxy: .after.proxied,
+       oldTtl: .before.ttl, newTtl: .after.ttl,
+       error}
+  ' <<<"$1"
 }
 #}}}
 
@@ -730,7 +747,7 @@ _load_config "$OPT_CONF"
 [[ -n "$ALL_RECORDS" && "$CMD" != get ]] && _usage "-a is available only for get."
 [[ -n "$ALL_RECORDS" && ${#NAME_OPTS[@]} -gt 0 ]] && _usage "-a and -n cannot be used together."
 [[ -n "$DRY_RUN" && "$CMD" != update && "$CMD" != sync ]] && _usage "-N is available only for update and sync."
-[[ "$OUTPUT" != text && "$OUTPUT" != json ]] && _usage "Invalid output format : $OUTPUT"
+[[ "$OUTPUT" != text && "$OUTPUT" != json && "$OUTPUT" != jsonl ]] && _usage "Invalid output format : $OUTPUT"
 [[ -n "$VALUE" && "$CMD" != update ]] && _usage "-v is available only for update."
 if [[ "$CMD" == update ]]; then
   [[ -z "$VALUE" ]] && _usage "Value is not specified."
