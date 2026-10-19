@@ -135,6 +135,21 @@ With `-o jsonl`, one JSON object is printed per record (one line each, no timest
 
 All keys are always present. The `old*` and `new*` values are `null` when the record is not found, and the `new*` values are `null` when the update itself failed.
 
+With `-o jsonl`, stderr is also one JSON object per line, for all subcommands. `level` is `error`, `warning` (retry of `IP_COMMAND`) or `debug` (`-V`). The migration message for legacy variables is put in `hint`.
+
+```json
+{"level":"warning","message":"Invalid IP address, retry after 5sec... : "}
+{"level":"error","message":"Couldn't get IP address. (Executed: curl -s https://ifconfig.me Result: )"}
+{"level":"debug","message":"GET https://api.cloudflare.com/client/v4/zones/xxx/dns_records?..."}
+```
+
+Exceptions (printed as text):
+
+* Errors before `-o jsonl` is read, and an invalid `-o` value: `jq` is not found, invalid long options (`--notify=foo` etc.), invalid subcommands, and options before `-o`. They exit with status 2.
+* The stderr of `IP_COMMAND` itself. Use a quiet command such as `IP_COMMAND=(curl -s https://ifconfig.me)` to keep the output JSON only.
+
+The error of `curl` is included in the error message (e.g. `... (curl exit code: 6) (curl: (6) Could not resolve host: api.cloudflare.com)`) instead of being printed on its own line. This applies to all output formats.
+
 ```
 journalctl -u cloudflare-dns -o cat | jq -c 'select(.status == "updated")'
 ```

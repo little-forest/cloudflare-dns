@@ -103,6 +103,8 @@ __get_tmp_base() { #{{{
   local TMP_BASE
   if [[ `uname` != Darwin ]]; then
     [[ -d /dev/shm ]] && TMP_BASE=/dev/shm/ || TMP_BASE=/tmp/
+  else
+    TMP_BASE="${TMPDIR:-/tmp}"; TMP_BASE="${TMP_BASE%/}/"
   fi
   TMP_BASE="${TMP_BASE}tmp.`basename $0`.$$"
   [[ ! -d "$TMP_BASE" ]] && mkdir "$TMP_BASE"
@@ -110,13 +112,12 @@ __get_tmp_base() { #{{{
 }
 #}}}
 
+# shellcheck disable=SC2120  # -d is optional
 __make_tmp() { #{{{
   local TMP_BASE=`__get_tmp_base`
   local OPT=()
   [[ "$1" == '-d' ]] && OPT+=($1)
-  [[ `uname` == Darwin ]] && OPT+=('-t') || OPT+=('-p')
-  OPT+=("$TMP_BASE")
-  mktemp ${OPT[@]}
+  mktemp ${OPT[@]} "${TMP_BASE}/tmp.XXXXXXXX"
 }
 #}}}
 
@@ -143,7 +144,7 @@ trap '__script_end' EXIT
 _usage() {
   if [[ -n "$1" ]]; then
     _err "$1"
-    echo "Run '$SCRIPT_NAME -h' to show usage." >&2
+    [[ "$OUTPUT" != jsonl ]] && echo "Run '$SCRIPT_NAME -h' to show usage." >&2
     _fatal_exit 2
   fi
   cat <<- EOM
@@ -163,7 +164,7 @@ _usage() {
 	  -N        Dry run (update/sync)         (--dry-run)
 	  -o FMT    text (default) | json | jsonl  (update/sync)  (--output=FMT)
 	            jsonl: one JSON object per record on stdout, and one JSON object
-	                   per message on stderr
+	                   per message on stderr (all subcommands)
 	  --notify[=MODE]  Send the result to Slack (sync only)
 	            always (default): every run
 	            changes: only when something is updated, planned or failed
@@ -204,14 +205,33 @@ _usage() {
 }
 #}}}
 
-# print error message to stderr, and keep it in ERR_LOG for the Slack notification
-_err() { #{{{
-  ERR_LOG+=("$*")
-  if [[ -t 2 ]]; then
-    echo -e "[${C_RED}ERROR${C_OFF}] $*" >&2
-  else
-    echo "[ERROR] $*" >&2
+# print a message to stderr. LEVEL: error | warning | debug
+# with -o jsonl, print {level, message[, hint]} in one line. otherwise print
+# "[ERROR] MSG" for error, MSG as it is for the others, and HINT in the following lines
+_log() { #{{{
+  local LEVEL="$1" MSG="$2" HINT="$3"
+  if [[ "$OUTPUT" == jsonl ]]; then
+    jq -cn --arg level "$LEVEL" --arg message "$MSG" --arg hint "$HINT" \
+      '{level: $level, message: $message} + (if $hint == "" then {} else {hint: $hint} end)' >&2
+    return
   fi
+  if [[ "$LEVEL" != error ]]; then
+    echo "$MSG" >&2
+  elif [[ -t 2 ]]; then
+    echo -e "[${C_RED}ERROR${C_OFF}] $MSG" >&2
+  else
+    echo "[ERROR] $MSG" >&2
+  fi
+  [[ -n "$HINT" ]] && echo "$HINT" >&2
+  return 0
+}
+#}}}
+
+# print error message to stderr, and keep it in ERR_LOG for the Slack notification
+# HINT (optional) is printed only to stderr
+_err() { #{{{
+  ERR_LOG+=("$1")
+  _log error "$1" "$2"
 }
 #}}}
 
@@ -229,7 +249,7 @@ _fatal_exit() { #{{{
 #}}}
 
 _verbose() { #{{{
-  [[ -n "$VERBOSE" ]] && echo "$*" >&2
+  [[ -n "$VERBOSE" ]] && _log debug "$*"
 }
 #}}}
 
@@ -287,14 +307,16 @@ _load_config() { #{{{
     [[ -n "$(eval "echo \${${V}+x}")" ]] && FOUND+=("$V")
   done
   if [[ ${#FOUND[@]} -gt 0 ]]; then
-    _err "Legacy variables are found in ${LOADED_RC} : ${FOUND[*]}"
-    cat <<- EOM >&2
+    local HINT
+    HINT=$(cat <<- EOM
 	  The config format has been changed. Migrate as follows and remove the legacy variables.
 	    DOMAIN=example.com              ->  RECORDS=("example.com")
 	    IP_SUPPLIER_SCRIPT="command"    ->  IP_COMMAND=(command)
 	    IP_PROVIDER_SCRIPT=(command)    ->  IP_COMMAND=(command)
 	  SLACK_* variables in dns-update.conf should also be moved into ${RC_FNAME}.
 	EOM
+    )
+    _err "Legacy variables are found in ${LOADED_RC} : ${FOUND[*]}" "$HINT"
     exit 2
   fi
 }
@@ -396,16 +418,21 @@ _cf_api() { #{{{
 
   CF_RESP='' CF_ERROR=''
   _verbose "$METHOD $URL"
-  local RC
-  CF_RESP=$(curl "${OPTS[@]}" "$URL"); RC=$?
+  # keep the error of curl in the error message instead of letting it go to stderr.
+  # it is not added to CF_ERROR, which is shown in the result of each record
+  local RC CURL_ERR DETAIL=''
+  # shellcheck disable=SC2119
+  CURL_ERR=$(__make_tmp)
+  CF_RESP=$(curl "${OPTS[@]}" "$URL" 2>"$CURL_ERR"); RC=$?
   if [[ $RC -ne 0 ]]; then
     CF_ERROR="failed to call Cloudflare API (curl exit code: $RC)"
+    [[ -s "$CURL_ERR" ]] && DETAIL=" ($(<"$CURL_ERR"))"
   elif ! jq -e '.success == true' <<<"$CF_RESP" >/dev/null 2>&1; then
     CF_ERROR=$(jq -r '[.errors[]? | "\(.code): \(.message)"] | join("; ")' <<<"$CF_RESP" 2>/dev/null)
     [[ -z "$CF_ERROR" ]] && CF_ERROR="invalid response from Cloudflare API"
   fi
   if [[ -n "$CF_ERROR" ]]; then
-    _err "$METHOD $API_PATH : $CF_ERROR"
+    _err "$METHOD $API_PATH : ${CF_ERROR}${DETAIL}"
     return 1
   fi
   return 0
@@ -561,15 +588,19 @@ _build_message() { #{{{
 
 # send TEXT to Slack. a failure is only reported to stderr (the exit status is not changed)
 _send_slack() { #{{{
-  local PAYLOAD CODE
+  local PAYLOAD CODE CURL_ERR MSG
   PAYLOAD=$(jq -cn --arg text "$1" --arg channel "$SLACK_CHANNEL" \
     --arg username "${SLACK_USER:-$(hostname)}" --arg icon "${SLACK_ICON:-:ghost:}" \
     '{text: $text, username: $username, icon_emoji: $icon}
        + (if $channel == "" then {} else {channel: $channel} end)')
+  # shellcheck disable=SC2119
+  CURL_ERR=$(__make_tmp)
   CODE=$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X POST \
-    -H 'Content-Type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL")
+    -H 'Content-Type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL" 2>"$CURL_ERR")
   if [[ ! "$CODE" =~ ^2[0-9][0-9]$ ]]; then
-    _err "Failed to send a message to Slack. (HTTP status: ${CODE:-none})"
+    MSG="Failed to send a message to Slack. (HTTP status: ${CODE:-none})"
+    [[ -s "$CURL_ERR" ]] && MSG+=" ($(<"$CURL_ERR"))"
+    _err "$MSG"
   fi
   return 0
 }
@@ -653,7 +684,7 @@ _get_ip() { #{{{
     else
       # retry after sleep
       ERR_LOG+=("Invalid IP address, retry after ${DELAY[$CNT]}sec... : $IP")
-      echo "Invalid IP address, retry after ${DELAY[$CNT]}sec... : $IP" >&2
+      _log warning "Invalid IP address, retry after ${DELAY[$CNT]}sec... : $IP"
       sleep "${DELAY[$CNT]}"
       CNT=$((CNT + 1))
     fi
