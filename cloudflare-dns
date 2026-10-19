@@ -593,12 +593,12 @@ _print_json() { #{{{
 _print_text() { #{{{
   local LABEL="Value"
   [[ "$CMD" == sync ]] && LABEL="Current IP"
-  jq -r --arg label "$LABEL" '
+  jq -r --arg heading "$LABEL" '
     def pad($n): . + (" " * ($n - length));
     def change($k): if .before[$k] == .after[$k] then empty
       else " \($k) \(.before[$k]) -> \(.after[$k])" end;
     (.results | map(.name | length) | max) as $w
-    | "\($label): \(.value)" + (if .dry_run then " (dry run)" else "" end),
+    | "\($heading): \(.value)" + (if .dry_run then " (dry run)" else "" end),
       (.results[]
         | "  " + (.status | pad(10)) + " " + (.name | pad($w)) + "  " + .type + "  "
           + (if .status == "failed" then .error
