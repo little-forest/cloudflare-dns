@@ -144,7 +144,7 @@ _usage() {
   if [[ -n "$1" ]]; then
     _err "$1"
     echo "Run '$SCRIPT_NAME -h' to show usage." >&2
-    exit 2
+    _fatal_exit 2
   fi
   cat <<- EOM
 	${C_WHITE}Usage:${C_OFF}
@@ -162,6 +162,9 @@ _usage() {
 	  -a        All records in the zone (get only)
 	  -N        Dry run (update/sync)         (--dry-run)
 	  -o FMT    text (default) | json  (update/sync)  (--output=FMT)
+	  --notify[=MODE]  Send the result to Slack (sync only)
+	            always (default): every run
+	            changes: only when something is updated, planned or failed
 	  -V        Verbose
 	  -h        Show usage                    (--help)
 
@@ -174,6 +177,8 @@ _usage() {
 	      ZONE_ID=XXXXXXXXXXXXXXXXXXXX
 	      IP_COMMAND=(curl -s https://ifconfig.me)
 	      RECORDS=("example.com" "www.example.com:A:300" "vpn.example.com:A::false")
+	      SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXXX   # required for --notify
+	      SLACK_CHANNEL="#channel"                                  # optional
 
 	${C_WHITE}Exit status:${C_OFF}
 	  0: all records are unchanged, updated or planned
@@ -187,6 +192,9 @@ _usage() {
 	  * Show changes without updating.
 	      $SCRIPT_NAME sync -N
 
+	  * Update records and notify Slack only when something changed.
+	      $SCRIPT_NAME sync --notify=changes
+
 	  * Update a record which is not in RECORDS.
 	      $SCRIPT_NAME update -n other.example.com:A:auto -v 203.0.113.5
 	EOM
@@ -194,8 +202,9 @@ _usage() {
 }
 #}}}
 
-# print error message to stderr
+# print error message to stderr, and keep it in ERR_LOG for the Slack notification
 _err() { #{{{
+  ERR_LOG+=("$*")
   if [[ -t 2 ]]; then
     echo -e "[${C_RED}ERROR${C_OFF}] $*" >&2
   else
@@ -206,7 +215,14 @@ _err() { #{{{
 
 # print error message and exit (default exit code: 1)
 _die() { #{{{
-  _err "$1"; exit "${2:-1}"
+  _err "$1"; _fatal_exit "${2:-1}"
+}
+#}}}
+
+# exit with RC. once NOTIFY_ARMED is set, the error is also sent to Slack
+_fatal_exit() { #{{{
+  [[ -n "$NOTIFY_ARMED" ]] && _notify_fatal
+  exit "$1"
 }
 #}}}
 
@@ -228,6 +244,12 @@ _normalize_long_opts() { #{{{
       --dry-run)  ARGS+=(-N) ;;
       --output=*) ARGS+=(-o "${A#--output=}") ;;
       --config=*) ARGS+=(-c "${A#--config=}") ;;
+      --notify)   OPT_NOTIFY=always ;;
+      --notify=*)
+        OPT_NOTIFY="${A#--notify=}"
+        [[ "$OPT_NOTIFY" == always || "$OPT_NOTIFY" == changes ]] \
+          || _usage "Invalid notify mode : $OPT_NOTIFY"
+        ;;
       --help)     ARGS+=(-h) ;;
       --)         ARGS+=(--); END_OF_OPTS=yes ;;
       --*)        _usage "Unknown option : $A" ;;
@@ -354,7 +376,7 @@ _collect_targets() { #{{{
     for E in "${ERRORS[@]}"; do
       _err "$E"
     done
-    exit 2
+    _fatal_exit 2
   fi
 }
 #}}}
@@ -497,7 +519,69 @@ _sync_all() { #{{{
   else
     _print_text "$ALL"
   fi
+
+  if [[ -n "$NOTIFY_MODE" ]]; then
+    local MSG
+    MSG=$(_build_message "$ALL")
+    [[ -n "$MSG" ]] && _send_slack "$MSG"
+  fi
   [[ $(jq '[.results[] | select(.status == "failed")] | length' <<<"$ALL") == 0 ]]
+}
+#}}}
+
+# build a Slack message from the result JSON of _sync_all
+# print nothing if there is no need to send (NOTIFY_MODE=changes and all unchanged)
+_build_message() { #{{{
+  jq -r --arg mode "$NOTIFY_MODE" '
+    def count($s): [.results[] | select(.status == $s)] | length;
+    def line:
+      if .status == "updated" then "✅ `\(.name)` : `\(.before.content)` → `\(.after.content)`"
+      elif .status == "planned" then "🔜 `\(.name)` : `\(.before.content)` → `\(.after.content)`"
+      elif .status == "unchanged" then "➖ `\(.name)` : `\(.after.content)`"
+      else "❌ `\(.name)` : \(.error)" end;
+    . as $all
+    | "Current IP : `\(.value)`" as $ip
+    | if count("failed") > 0 then
+        "<!channel> Failed to update some DNS records!"
+      elif count("updated") > 0 then
+        "<!channel> IP address has been changed!"
+      elif count("planned") > 0 then
+        "<!channel> IP address has been changed! (not updated)"
+      else null end
+    | if . == null then
+        (if $mode == "changes" then empty else $ip end)
+      else
+        ([., $ip] + [$all.results[] | line]) | join("\n")
+      end
+  ' <<<"$1"
+}
+#}}}
+
+# send TEXT to Slack. a failure is only reported to stderr (the exit status is not changed)
+_send_slack() { #{{{
+  local PAYLOAD CODE
+  PAYLOAD=$(jq -cn --arg text "$1" --arg channel "$SLACK_CHANNEL" \
+    --arg username "${SLACK_USER:-$(hostname)}" --arg icon "${SLACK_ICON:-:ghost:}" \
+    '{text: $text, username: $username, icon_emoji: $icon}
+       + (if $channel == "" then {} else {channel: $channel} end)')
+  CODE=$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL")
+  if [[ ! "$CODE" =~ ^2[0-9][0-9]$ ]]; then
+    _err "Failed to send a message to Slack. (HTTP status: ${CODE:-none})"
+  fi
+  return 0
+}
+#}}}
+
+# send the last error and the recent ones in ERR_LOG to Slack
+_notify_fatal() { #{{{
+  local N=${#ERR_LOG[@]}
+  local TEXT="<!channel> ${SCRIPT_NAME} failed!"
+  if [[ $N -gt 0 ]]; then
+    TEXT+=$'\n'"${ERR_LOG[N-1]}"
+    TEXT+=$'\n```\n'"$(printf '%s\n' "${ERR_LOG[@]}" | tail -n 20)"$'\n```'
+  fi
+  _send_slack "$TEXT"
 }
 #}}}
 
@@ -528,7 +612,8 @@ _print_text() { #{{{
 }
 #}}}
 
-# print the current IP address using IP_COMMAND (with retry)
+# get the current IP address into CUR_IP using IP_COMMAND (with retry)
+# not called in a subshell, so that the messages are kept in ERR_LOG
 _get_ip() { #{{{
   if [[ ${#IP_COMMAND[@]} -eq 0 ]]; then
     _die "IP_COMMAND is not specified." 2
@@ -546,10 +631,11 @@ _get_ip() { #{{{
 
     # validate it
     if _validate_ipv4 "$IP"; then
-      echo "${IP}"
+      CUR_IP="$IP"
       return 0
     else
       # retry after sleep
+      ERR_LOG+=("Invalid IP address, retry after ${DELAY[$CNT]}sec... : $IP")
       echo "Invalid IP address, retry after ${DELAY[$CNT]}sec... : $IP" >&2
       sleep "${DELAY[$CNT]}"
       CNT=$((CNT + 1))
@@ -577,6 +663,7 @@ _validate_ipv4() { #{{{
 #- Main process ----------------------------------------------------------------
 #-------------------------------------------------------------------------------
 tty -s && __setupcolor
+ERR_LOG=() OPT_NOTIFY='' NOTIFY_MODE='' NOTIFY_ARMED=''
 
 #- Check dependencies ----------------------------------------------------------
 command -v jq > /dev/null 2>&1 || _die "jq executable is not found." 2
@@ -638,11 +725,8 @@ _load_config "$OPT_CONF"
 
 #- Check options ---------------------------------------------------------------
 #{{{
-if [[ "$CMD" != show-ip ]]; then
-  [[ -z "$ZONE_ID" ]] && _usage "ZONE_ID is not given."
-  [[ -z "$CLOUDFLARE_API_TOKEN" ]] && _usage "CLOUDFLARE_API_TOKEN is not given."
-  _verbose "Hosted zone id: $ZONE_ID"
-fi
+# errors before NOTIFY_ARMED is set are reported only to stderr
+[[ -n "$OPT_NOTIFY" && "$CMD" != sync ]] && _usage "--notify is available only for sync."
 [[ -n "$ALL_RECORDS" && "$CMD" != get ]] && _usage "-a is available only for get."
 [[ -n "$ALL_RECORDS" && ${#NAME_OPTS[@]} -gt 0 ]] && _usage "-a and -n cannot be used together."
 [[ -n "$DRY_RUN" && "$CMD" != update && "$CMD" != sync ]] && _usage "-N is available only for update and sync."
@@ -653,6 +737,17 @@ if [[ "$CMD" == update ]]; then
   _validate_ipv4 "$VALUE" || _usage "Invalid IPv4 address : $VALUE"
 fi
 
+NOTIFY_MODE="$OPT_NOTIFY"
+if [[ -n "$NOTIFY_MODE" ]]; then
+  [[ -z "$SLACK_WEBHOOK_URL" ]] && _usage "SLACK_WEBHOOK_URL is not given. It is required for --notify."
+  NOTIFY_ARMED=yes
+fi
+
+if [[ "$CMD" != show-ip ]]; then
+  [[ -z "$ZONE_ID" ]] && _usage "ZONE_ID is not given."
+  [[ -z "$CLOUDFLARE_API_TOKEN" ]] && _usage "CLOUDFLARE_API_TOKEN is not given."
+  _verbose "Hosted zone id: $ZONE_ID"
+fi
 if [[ "$CMD" != show-ip && -z "$ALL_RECORDS" ]]; then
   _collect_targets
 fi
@@ -671,11 +766,12 @@ case $CMD in
     _sync_all "$VALUE"
     ;;
   sync)
-    VALUE=$(_get_ip) || exit $?
-    _sync_all "$VALUE"
+    _get_ip || _fatal_exit 1
+    _sync_all "$CUR_IP"
     ;;
   show-ip)
-    _get_ip
+    _get_ip || exit 1
+    echo "$CUR_IP"
     ;;
 esac
 
