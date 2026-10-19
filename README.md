@@ -2,14 +2,13 @@
 
 Keep multiple Cloudflare DNS A records in sync with the current global IP address.
 
-* `cloudflare-dns` : calls the Cloudflare API (get / update / sync records)
-* `dns-update` : runs `cloudflare-dns sync` and sends the result to Slack (used by systemd timers)
+`cloudflare-dns` calls the Cloudflare API (get / update / sync records) and, with `--notify`, sends the result to Slack. The systemd timers run it directly.
 
 Requirements: `bash`, `curl`, `jq`
 
 ## Configuration file
 
-Both commands read the same file. The first one found in the following order is loaded.
+The first one found in the following order is loaded.
 
 1. The file specified with `-c`
 2. `./cloudflare-dns.conf`
@@ -35,14 +34,14 @@ SLACK_WEBHOOK_URL=<YOUR_WEBHOOK_URL>
 SLACK_CHANNEL="#<YOUR_CHANNEL>"
 ```
 
-| Variable | Required | Used by | Description |
-| --- | --- | --- | --- |
-| `CLOUDFLARE_API_TOKEN` | yes | cloudflare-dns | API token with Zone.DNS:Edit permission |
-| `ZONE_ID` | yes | cloudflare-dns | Can be overridden with `-z` |
-| `IP_COMMAND` | for `sync` / `show-ip` | cloudflare-dns | Command (**array**) which prints the current IPv4 address in one line |
-| `RECORDS` | unless `-n` is given | cloudflare-dns | Array of `NAME[:TYPE[:TTL[:PROXIED]]]` |
-| `SLACK_WEBHOOK_URL` | | dns-update | No notification if empty |
-| `SLACK_CHANNEL` / `SLACK_USER` / `SLACK_ICON` | | dns-update | `SLACK_USER` defaults to `hostname`, `SLACK_ICON` to `:ghost:` |
+| Variable | Required | Description |
+| --- | --- | --- |
+| `CLOUDFLARE_API_TOKEN` | yes | API token with Zone.DNS:Edit permission |
+| `ZONE_ID` | yes | Can be overridden with `-z` |
+| `IP_COMMAND` | for `sync` / `show-ip` | Command (**array**) which prints the current IPv4 address in one line |
+| `RECORDS` | unless `-n` is given | Array of `NAME[:TYPE[:TTL[:PROXIED]]]` |
+| `SLACK_WEBHOOK_URL` | for `--notify` | Slack incoming webhook URL |
+| `SLACK_CHANNEL` / `SLACK_USER` / `SLACK_ICON` | | `SLACK_USER` defaults to `hostname`, `SLACK_ICON` to `:ghost:` |
 
 ### Record spec `NAME[:TYPE[:TTL[:PROXIED]]]`
 
@@ -67,6 +66,9 @@ cloudflare-dns <get|update|sync|show-ip> [options]
   -a        All records in the zone (get only)
   -N        Dry run (update/sync)                     (--dry-run)
   -o FMT    text (default) | json  (update/sync)      (--output=FMT)
+  --notify[=MODE]  Send the result to Slack (sync only)
+            always (default): every run
+            changes: only when something is updated, planned or failed
   -V        Verbose
   -h        Show usage                                (--help)
 ```
@@ -117,32 +119,18 @@ With `-o json`:
 
 `CF_API_BASE` environment variable changes the API endpoint (default: `https://api.cloudflare.com/client/v4`). It is intended for testing with a local stub.
 
-### Examples
+### Slack notification (`--notify`)
 
-* Show the records in `RECORDS`: `cloudflare-dns get`
-* Show all records in the zone: `cloudflare-dns get -a`
-* Check what will change: `cloudflare-dns sync -N`
-* Update all records in `RECORDS`: `cloudflare-dns sync`
-* Update a record which is not in `RECORDS`: `cloudflare-dns update -n other.example.com:A:auto -v 203.0.113.5`
+`sync --notify` sends one Slack message per run. Without `--notify`, nothing is sent even if `SLACK_WEBHOOK_URL` is set.
+The output to stdout and the exit status are the same as without `--notify`.
 
-## dns-update
-
-```
-dns-update [-c CONF] [-u] [-s] [-h]
-  -c : config file path (passed through to cloudflare-dns)
-  -u : update records (without -u: check only = cloudflare-dns sync -N)
-  -s : silent on Slack unless something changed or failed
-```
-
-One Slack message is sent per run.
-
-| Situation | Slack | Exit status |
-| --- | --- | --- |
-| All `unchanged` | Not sent with `-s`. Otherwise the current IP address | 0 |
-| Some `planned` (without `-u`) | `<!channel>`, listed with 🔜, `(not updated)` in the headline | 0 |
-| Some `updated`, none `failed` | `<!channel>`, listed with ✅ | 0 |
-| Some `failed` | `<!channel>`, listed with ❌ and the reason | 1 |
-| Fatal error | `<!channel> dns-update failed!` with the last 20 lines of stderr (sent even with `-s`) | non-zero |
+| Situation | `--notify` (= `--notify=always`) | `--notify=changes` | Exit status |
+| --- | --- | --- | --- |
+| All `unchanged` | The current IP address | Not sent | 0 |
+| Some `planned` (with `-N`) | `<!channel>`, listed with 🔜, `(not updated)` in the headline | same | 0 |
+| Some `updated`, none `failed` | `<!channel>`, listed with ✅ | same | 0 |
+| Some `failed` | `<!channel>`, listed with ❌ and the reason | same | 1 |
+| Fatal error | `<!channel> cloudflare-dns failed!` with the error messages of the run (up to 20 lines) | same | 1 or 2 |
 
 ```
 <!channel> IP address has been changed!
@@ -151,19 +139,30 @@ Current IP : `203.0.113.5`
 ➖ `www.example.com` : `203.0.113.5`
 ```
 
-Fatal errors are: `cloudflare-dns` exits without a result (IP address acquisition failure, configuration error, legacy variables, ...), or `cloudflare-dns` is not found.
-Errors before reading `SLACK_*` (e.g. the file given with `-c` does not exist) are printed only to stderr.
+Fatal errors are: the IP address could not be acquired, or `ZONE_ID` / `CLOUDFLARE_API_TOKEN` / `RECORDS` / `IP_COMMAND` is invalid.
+The following errors are printed only to stderr, because they occur before the Slack settings are validated: invalid options, the config file is not found, legacy variables, and `--notify` without `SLACK_WEBHOOK_URL` (exit status 2).
+
+A failure to send the message to Slack (including HTTP errors) is printed to stderr. It does not change the exit status.
+
+### Examples
+
+* Show the records in `RECORDS`: `cloudflare-dns get`
+* Show all records in the zone: `cloudflare-dns get -a`
+* Check what will change: `cloudflare-dns sync -N`
+* Update all records in `RECORDS`: `cloudflare-dns sync`
+* Update all records and notify Slack only when something changed: `cloudflare-dns sync --notify=changes`
+* Update a record which is not in `RECORDS`: `cloudflare-dns update -n other.example.com:A:auto -v 203.0.113.5`
 
 ## Installing systemd unit files
 
 ```
 sudo mkdir -p /opt/cloudflare-dns
-sudo cp cloudflare-dns dns-update /opt/cloudflare-dns/
+sudo cp cloudflare-dns /opt/cloudflare-dns/
 sudo cp conf-example/cloudflare-dns.conf /etc/cloudflare-dns.conf   # then edit it
 sudo chmod 600 /etc/cloudflare-dns.conf
 sudo cp systemd/cloudflare-dns*.service systemd/cloudflare-dns*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now cloudflare-dns.timer          # update records every 5 minutes
+sudo systemctl enable --now cloudflare-dns.timer          # update records every 5 minutes (notify only on changes)
 sudo systemctl enable --now cloudflare-dns-notify.timer   # notify the current IP address every hour
 ```
 
@@ -182,4 +181,7 @@ The old format is rejected with exit status 2 and a migration message.
 | `-t A -n NAME -l TTL` | `-n NAME:A:TTL` |
 | `get` without arguments (all records in the zone) | `get -a` |
 | `dns-update -d` | Write it in `RECORDS` |
-| systemd `-c /etc/dns-update.conf` | `-c /etc/cloudflare-dns.conf` |
+| `dns-update -s -u` | `cloudflare-dns sync --notify=changes` |
+| `dns-update` (without `-u`) | `cloudflare-dns sync -N --notify` |
+| `/opt/cloudflare-dns/dns-update` | Not used any more. Remove it |
+| systemd `dns-update -c /etc/dns-update.conf ...` | Replace the unit files with the ones in `systemd/` |
