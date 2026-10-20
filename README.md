@@ -65,12 +65,13 @@ cloudflare-dns <get|update|sync|show-ip> [options]
   -v VALUE  Value to set (update only)
   -a        All records in the zone (get only)
   -N        Dry run (update/sync)                     (--dry-run)
-  -o FMT    text (default) | json  (update/sync)  (--output=FMT)
-            json: one JSON object per record on stdout, and one JSON object
-                  per message on stderr
-  --notify[=MODE]  Send the result to Slack (sync only)
+  -o FMT    text (default) | json  (update/sync/show-ip)  (--output=FMT)
+            json: one JSON object per record (show-ip: per IP address) on
+                  stdout, and one JSON object per message on stderr
+  --notify[=MODE]  Send the result to Slack (sync/show-ip)
             always (default): every run
             changes: only when something is updated, planned or failed
+                     (sync only)
   -V        Verbose
   -h        Show usage                                (--help)
 ```
@@ -82,7 +83,7 @@ Without `-n`, all records in `RECORDS` are targeted. `-n` also accepts records w
 | `get` | Print the target records as a JSON array. `-a` prints all records in the zone |
 | `update -v VALUE` | Set VALUE to the target records (and TTL/PROXIED if specified) |
 | `sync` | Same as `update`, using the IP address from `IP_COMMAND` (acquired once per run) |
-| `show-ip` | Print the current IP address from `IP_COMMAND` (with retry) |
+| `show-ip` | Print the current IP address from `IP_COMMAND` (with retry). `-o json` prints it as a JSON object. `--notify` sends it to Slack |
 
 Each record results in `unchanged`, `updated`, `planned` (dry run) or `failed`. Records with no difference are not patched.
 Even if some records fail, the remaining ones are processed.
@@ -128,6 +129,12 @@ With `-o json`, one JSON object is printed per record (one line each, compact, n
 
 All keys except `error` are always present. The `old*` and `new*` values are `null` when the record is not found, and the `new*` values are `null` when the update itself failed.
 
+`show-ip -o json` prints one line instead of the IP address. `level` is always `info`, with or without `--notify`.
+
+```json
+{"level":"info","currentIP":"203.0.113.5"}
+```
+
 With `-o json`, stderr is also one JSON object per line (compact, no color), for all subcommands. `level` is `error`, `warning` (retry of `IP_COMMAND`) or `debug` (`-V`). The migration message for legacy variables is put in `hint`.
 
 ```json
@@ -157,8 +164,10 @@ journalctl -u cloudflare-dns -o cat | jq -c 'select(.level != "debug")'
 
 ### Slack notification (`--notify`)
 
-`sync --notify` sends one Slack message per run. Without `--notify`, nothing is sent even if `SLACK_WEBHOOK_URL` is set.
-The output to stdout and the exit status are the same as without `--notify`, except `level` of `-o json` (`--notify=changes` lowers `unchanged` to `debug`).
+`sync --notify` and `show-ip --notify` send one Slack message per run. Without `--notify`, nothing is sent even if `SLACK_WEBHOOK_URL` is set.
+The output to stdout and the exit status are the same as without `--notify`, except `level` of `sync -o json` (`--notify=changes` lowers `unchanged` to `debug`).
+
+`sync --notify`:
 
 | Situation | `--notify` (= `--notify=always`) | `--notify=changes` | Exit status |
 | --- | --- | --- | --- |
@@ -175,7 +184,14 @@ Current IP : `203.0.113.5`
 ➖ `www.example.com` : `203.0.113.5`
 ```
 
-Fatal errors are: the IP address could not be acquired, or `ZONE_ID` / `CLOUDFLARE_API_TOKEN` / `RECORDS` / `IP_COMMAND` is invalid.
+`show-ip --notify` (`--notify=changes` is rejected with exit status 2):
+
+| Situation | Message | Exit status |
+| --- | --- | --- |
+| The IP address is acquired | ``Current IP : `203.0.113.5` `` (the same text as `sync --notify` with all `unchanged`) | 0 |
+| Fatal error | `<!channel> cloudflare-dns failed!` with the error messages of the run | 1 or 2 |
+
+Fatal errors are: the IP address could not be acquired, or `ZONE_ID` / `CLOUDFLARE_API_TOKEN` / `RECORDS` / `IP_COMMAND` is invalid (`show-ip` checks only `IP_COMMAND`).
 The following errors are printed only to stderr, because they occur before the Slack settings are validated: invalid options, the config file is not found, legacy variables, and `--notify` without `SLACK_WEBHOOK_URL` (exit status 2).
 
 A failure to send the message to Slack (including HTTP errors) is printed to stderr. It does not change the exit status.
@@ -218,6 +234,6 @@ The old format is rejected with exit status 2 and a migration message.
 | `get` without arguments (all records in the zone) | `get -a` |
 | `dns-update -d` | Write it in `RECORDS` |
 | `dns-update -s -u` | `cloudflare-dns sync --notify=changes` |
-| `dns-update` (without `-u`) | `cloudflare-dns sync -N --notify` |
+| `dns-update` (without `-u`) | `cloudflare-dns show-ip --notify` (the current IP address only), or `cloudflare-dns sync -N --notify` (with the differences from the records) |
 | `/opt/cloudflare-dns/dns-update` | Not used any more. Remove it |
 | systemd `dns-update -c /etc/dns-update.conf ...` | Replace the unit files with the ones in `systemd/` |

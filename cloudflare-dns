@@ -162,12 +162,14 @@ _usage() {
 	  -v VALUE  Value to set (update only)
 	  -a        All records in the zone (get only)
 	  -N        Dry run (update/sync)         (--dry-run)
-	  -o FMT    text (default) | json  (update/sync)  (--output=FMT)
-	            json: one JSON object per record on stdout, and one JSON object
-	                  per message on stderr (all subcommands)
-	  --notify[=MODE]  Send the result to Slack (sync only)
+	  -o FMT    text (default) | json  (update/sync/show-ip)  (--output=FMT)
+	            json: one JSON object per record (show-ip: per IP address) on
+	                  stdout, and one JSON object per message on stderr
+	                  (all subcommands)
+	  --notify[=MODE]  Send the result to Slack (sync/show-ip)
 	            always (default): every run
 	            changes: only when something is updated, planned or failed
+	                     (sync only)
 	  -V        Verbose
 	  -h        Show usage                    (--help)
 
@@ -772,7 +774,10 @@ _load_config "$OPT_CONF"
 #- Check options ---------------------------------------------------------------
 #{{{
 # errors before NOTIFY_ARMED is set are reported only to stderr
-[[ -n "$OPT_NOTIFY" && "$CMD" != sync ]] && _usage "--notify is available only for sync."
+[[ -n "$OPT_NOTIFY" && "$CMD" != sync && "$CMD" != show-ip ]] \
+  && _usage "--notify is available only for sync and show-ip."
+[[ "$OPT_NOTIFY" == changes && "$CMD" == show-ip ]] \
+  && _usage "--notify=changes is available only for sync."
 [[ -n "$ALL_RECORDS" && "$CMD" != get ]] && _usage "-a is available only for get."
 [[ -n "$ALL_RECORDS" && ${#NAME_OPTS[@]} -gt 0 ]] && _usage "-a and -n cannot be used together."
 [[ -n "$DRY_RUN" && "$CMD" != update && "$CMD" != sync ]] && _usage "-N is available only for update and sync."
@@ -816,8 +821,15 @@ case $CMD in
     _sync_all "$CUR_IP"
     ;;
   show-ip)
-    _get_ip || exit 1
-    echo "$CUR_IP"
+    _get_ip || _fatal_exit 1
+    if [[ "$OUTPUT" == json ]]; then
+      jq -cnM --arg ip "$CUR_IP" '{level: "info", currentIP: $ip}'
+    else
+      echo "$CUR_IP"
+    fi
+    if [[ -n "$NOTIFY_MODE" ]]; then
+      _send_slack "Current IP : \`$CUR_IP\`"
+    fi
     ;;
 esac
 
