@@ -214,8 +214,8 @@ sudo cp conf-example/cloudflare-dns.conf /etc/cloudflare-dns.conf   # then edit 
 sudo chmod 600 /etc/cloudflare-dns.conf
 sudo cp systemd/cloudflare-dns*.service systemd/cloudflare-dns*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now cloudflare-dns.timer          # update records every 5 minutes (notify only on changes)
-sudo systemctl enable --now cloudflare-dns-notify.timer   # notify the current IP address every hour
+sudo systemctl enable --now cloudflare-dns-sync.timer      # update records every 5 minutes (notify only on changes)
+sudo systemctl enable --now cloudflare-dns-show-ip.timer   # notify the current IP address at 00:02, 06:02, 12:02 and 18:02
 ```
 
 The current directory is `/` under systemd, so use `/etc/cloudflare-dns.conf` (the services pass it with `-c`).
@@ -237,3 +237,13 @@ The old format is rejected with exit status 2 and a migration message.
 | `dns-update` (without `-u`) | `cloudflare-dns show-ip --notify` (the current IP address only), or `cloudflare-dns sync -N --notify` (with the differences from the records) |
 | `/opt/cloudflare-dns/dns-update` | Not used any more. Remove it |
 | systemd `dns-update -c /etc/dns-update.conf ...` | Replace the unit files with the ones in `systemd/` |
+| systemd `cloudflare-dns.{service,timer}` | `cloudflare-dns-sync.{service,timer}` |
+| systemd `cloudflare-dns-notify.{service,timer}` | `cloudflare-dns-show-ip.{service,timer}` |
+
+If the old units are installed, remove them before installing the new ones. Otherwise both timers run.
+
+```
+sudo systemctl disable --now cloudflare-dns.timer cloudflare-dns-notify.timer
+sudo rm /etc/systemd/system/cloudflare-dns.{service,timer} /etc/systemd/system/cloudflare-dns-notify.{service,timer}
+sudo systemctl daemon-reload
+```

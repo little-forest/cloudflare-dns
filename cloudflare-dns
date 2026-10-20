@@ -1,9 +1,6 @@
 #!/bin/bash
 #===============================================================================
 # cloudflare-dns : Cloudflare DNS record manage script
-# Date    :  2024/01/07 Start
-# Copyright: Original code by Yusuke Komori.
-#                  Copyright (c) 2024. Yusuke Komori, All rights reserved.
 #===============================================================================
 
 SCRIPT_BASE=`echo $(cd $(dirname $0); pwd)`
