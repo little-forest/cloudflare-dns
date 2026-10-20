@@ -144,7 +144,7 @@ trap '__script_end' EXIT
 _usage() {
   if [[ -n "$1" ]]; then
     _err "$1"
-    [[ "$OUTPUT" != jsonl ]] && echo "Run '$SCRIPT_NAME -h' to show usage." >&2
+    [[ "$OUTPUT" != json ]] && echo "Run '$SCRIPT_NAME -h' to show usage." >&2
     _fatal_exit 2
   fi
   cat <<- EOM
@@ -162,9 +162,9 @@ _usage() {
 	  -v VALUE  Value to set (update only)
 	  -a        All records in the zone (get only)
 	  -N        Dry run (update/sync)         (--dry-run)
-	  -o FMT    text (default) | json | jsonl  (update/sync)  (--output=FMT)
-	            jsonl: one JSON object per record on stdout, and one JSON object
-	                   per message on stderr (all subcommands)
+	  -o FMT    text (default) | json  (update/sync)  (--output=FMT)
+	            json: one JSON object per record on stdout, and one JSON object
+	                  per message on stderr (all subcommands)
 	  --notify[=MODE]  Send the result to Slack (sync only)
 	            always (default): every run
 	            changes: only when something is updated, planned or failed
@@ -206,12 +206,12 @@ _usage() {
 #}}}
 
 # print a message to stderr. LEVEL: error | warning | debug
-# with -o jsonl, print {level, message[, hint]} in one line. otherwise print
+# with -o json, print {level, message[, hint]} in one line without color. otherwise print
 # "[ERROR] MSG" for error, MSG as it is for the others, and HINT in the following lines
 _log() { #{{{
   local LEVEL="$1" MSG="$2" HINT="$3"
-  if [[ "$OUTPUT" == jsonl ]]; then
-    jq -cn --arg level "$LEVEL" --arg message "$MSG" --arg hint "$HINT" \
+  if [[ "$OUTPUT" == json ]]; then
+    jq -cnM --arg level "$LEVEL" --arg message "$MSG" --arg hint "$HINT" \
       '{level: $level, message: $message} + (if $hint == "" then {} else {hint: $hint} end)' >&2
     return
   fi
@@ -544,9 +544,8 @@ _sync_all() { #{{{
     '{value: $value, dry_run: ($dry != ""), results: .}')
 
   case "$OUTPUT" in
-    json)  _print_json "$ALL" ;;
-    jsonl) _print_jsonl "$ALL" ;;
-    *)     _print_text "$ALL" ;;
+    json) _print_json "$ALL" ;;
+    *)    _print_text "$ALL" ;;
   esac
 
   if [[ -n "$NOTIFY_MODE" ]]; then
@@ -618,22 +617,21 @@ _notify_fatal() { #{{{
 }
 #}}}
 
+# one line per record, without color. a missing before/after (failed) results in null values
+# level: failed -> error, unchanged with --notify=changes -> debug, otherwise info
+# error is present only when the record failed
 _print_json() { #{{{
-  jq . <<<"$1"
-}
-#}}}
-
-# one line per record. a missing before/after (failed) results in null values
-_print_jsonl() { #{{{
-  jq -c '
+  jq -cM --arg mode "$NOTIFY_MODE" '
     .value as $ip
     | .results[]
-    | {level: (if .status == "failed" then "error" else "info" end),
+    | {level: (if .status == "failed" then "error"
+               elif .status == "unchanged" and $mode == "changes" then "debug"
+               else "info" end),
        currentIP: $ip, status, record: .name, type,
        oldIP: .before.content, newIP: .after.content,
        oldDnsProxy: .before.proxied, newDnsProxy: .after.proxied,
-       oldTtl: .before.ttl, newTtl: .after.ttl,
-       error}
+       oldTtl: .before.ttl, newTtl: .after.ttl}
+      + (if .error == null then {} else {error} end)
   ' <<<"$1"
 }
 #}}}
@@ -778,7 +776,7 @@ _load_config "$OPT_CONF"
 [[ -n "$ALL_RECORDS" && "$CMD" != get ]] && _usage "-a is available only for get."
 [[ -n "$ALL_RECORDS" && ${#NAME_OPTS[@]} -gt 0 ]] && _usage "-a and -n cannot be used together."
 [[ -n "$DRY_RUN" && "$CMD" != update && "$CMD" != sync ]] && _usage "-N is available only for update and sync."
-[[ "$OUTPUT" != text && "$OUTPUT" != json && "$OUTPUT" != jsonl ]] && _usage "Invalid output format : $OUTPUT"
+[[ "$OUTPUT" != text && "$OUTPUT" != json ]] && _usage "Invalid output format : $OUTPUT"
 [[ -n "$VALUE" && "$CMD" != update ]] && _usage "-v is available only for update."
 if [[ "$CMD" == update ]]; then
   [[ -z "$VALUE" ]] && _usage "Value is not specified."

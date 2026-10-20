@@ -65,9 +65,9 @@ cloudflare-dns <get|update|sync|show-ip> [options]
   -v VALUE  Value to set (update only)
   -a        All records in the zone (get only)
   -N        Dry run (update/sync)                     (--dry-run)
-  -o FMT    text (default) | json | jsonl  (update/sync)  (--output=FMT)
-            jsonl: one JSON object per record on stdout, and one JSON object
-                   per message on stderr
+  -o FMT    text (default) | json  (update/sync)  (--output=FMT)
+            json: one JSON object per record on stdout, and one JSON object
+                  per message on stderr
   --notify[=MODE]  Send the result to Slack (sync only)
             always (default): every run
             changes: only when something is updated, planned or failed
@@ -96,34 +96,19 @@ Current IP: 203.0.113.5
 1 updated, 1 unchanged, 1 failed
 ```
 
-With `-o json`:
+With `-o json`, one JSON object is printed per record (one line each, compact, no color, no timestamp). The systemd services use this format so that the results in the journal can be sent to a log collector such as Datadog, or filtered with `jq`.
+
+`sync --notify=changes`:
 
 ```json
-{
-  "value": "203.0.113.5",
-  "dry_run": false,
-  "results": [
-    {"name": "example.com", "type": "A", "status": "updated",
-     "before": {"content": "198.51.100.1", "ttl": 1, "proxied": true},
-     "after":  {"content": "203.0.113.5",  "ttl": 1, "proxied": true},
-     "error": null},
-    {"name": "missing.example.com", "type": "A", "status": "failed",
-     "before": null, "after": null, "error": "record not found"}
-  ]
-}
-```
-
-With `-o jsonl`, one JSON object is printed per record (one line each, no timestamp). The systemd services use this format so that the results in the journal can be filtered with `jq`.
-
-```json
-{"level":"info","currentIP":"203.0.113.5","status":"updated","record":"example.com","type":"A","oldIP":"198.51.100.1","newIP":"203.0.113.5","oldDnsProxy":true,"newDnsProxy":true,"oldTtl":1,"newTtl":1,"error":null}
-{"level":"info","currentIP":"203.0.113.5","status":"unchanged","record":"www.example.com","type":"A","oldIP":"203.0.113.5","newIP":"203.0.113.5","oldDnsProxy":false,"newDnsProxy":false,"oldTtl":300,"newTtl":300,"error":null}
+{"level":"info","currentIP":"203.0.113.5","status":"updated","record":"example.com","type":"A","oldIP":"198.51.100.1","newIP":"203.0.113.5","oldDnsProxy":true,"newDnsProxy":true,"oldTtl":1,"newTtl":1}
+{"level":"debug","currentIP":"203.0.113.5","status":"unchanged","record":"www.example.com","type":"A","oldIP":"203.0.113.5","newIP":"203.0.113.5","oldDnsProxy":false,"newDnsProxy":false,"oldTtl":300,"newTtl":300}
 {"level":"error","currentIP":"203.0.113.5","status":"failed","record":"missing.example.com","type":"A","oldIP":null,"newIP":null,"oldDnsProxy":null,"newDnsProxy":null,"oldTtl":null,"newTtl":null,"error":"record not found"}
 ```
 
 | Key | Type | Description |
 | --- | --- | --- |
-| `level` | string | `error` for `failed`, otherwise `info` |
+| `level` | string | `error` for `failed`, `debug` for `unchanged` with `--notify=changes`, otherwise `info` |
 | `currentIP` | string | The IP address from `IP_COMMAND` (`sync`), or `-v VALUE` (`update`) |
 | `status` | string | `updated` / `planned` / `unchanged` / `failed` |
 | `record` | string | Record name (lowercased, without the trailing `.`) |
@@ -131,11 +116,19 @@ With `-o jsonl`, one JSON object is printed per record (one line each, no timest
 | `oldIP` / `newIP` | string \| null | `content` before / after the update (planned value for `planned`) |
 | `oldDnsProxy` / `newDnsProxy` | boolean \| null | `proxied` before / after the update |
 | `oldTtl` / `newTtl` | number \| null | `ttl` before / after the update (`1` is auto) |
-| `error` | string \| null | The reason of `failed` |
+| `error` | string | The reason of `failed`. Only present in `failed` records |
 
-All keys are always present. The `old*` and `new*` values are `null` when the record is not found, and the `new*` values are `null` when the update itself failed.
+`level` is decided per record. Only `--notify=changes`, which does not send a message for unchanged records, lowers `unchanged` to `debug`.
 
-With `-o jsonl`, stderr is also one JSON object per line, for all subcommands. `level` is `error`, `warning` (retry of `IP_COMMAND`) or `debug` (`-V`). The migration message for legacy variables is put in `hint`.
+| Result of the run | `--notify` (= `--notify=always`) | `--notify=changes` | Without `--notify` |
+| --- | --- | --- | --- |
+| All `unchanged` | Sent / each record `info` | Not sent / each record `debug` | Not sent / each record `info` |
+| Some `updated` / `planned` | Sent / all records `info` | Sent / changed records `info`, `unchanged` records `debug` | Not sent / all records `info` |
+| Some `failed` | Sent / the record `error` | Sent / the record `error` | Not sent / the record `error` |
+
+All keys except `error` are always present. The `old*` and `new*` values are `null` when the record is not found, and the `new*` values are `null` when the update itself failed.
+
+With `-o json`, stderr is also one JSON object per line (compact, no color), for all subcommands. `level` is `error`, `warning` (retry of `IP_COMMAND`) or `debug` (`-V`). The migration message for legacy variables is put in `hint`.
 
 ```json
 {"level":"warning","message":"Invalid IP address, retry after 5sec... : "}
@@ -145,13 +138,13 @@ With `-o jsonl`, stderr is also one JSON object per line, for all subcommands. `
 
 Exceptions (printed as text):
 
-* Errors before `-o jsonl` is read, and an invalid `-o` value: `jq` is not found, invalid long options (`--notify=foo` etc.), invalid subcommands, and options before `-o`. They exit with status 2.
+* Errors before `-o json` is read, and an invalid `-o` value: `jq` is not found, invalid long options (`--notify=foo` etc.), invalid subcommands, and options before `-o`. They exit with status 2.
 * The stderr of `IP_COMMAND` itself. Use a quiet command such as `IP_COMMAND=(curl -s https://ifconfig.me)` to keep the output JSON only.
 
 The error of `curl` is included in the error message (e.g. `... (curl exit code: 6) (curl: (6) Could not resolve host: api.cloudflare.com)`) instead of being printed on its own line. This applies to all output formats.
 
 ```
-journalctl -u cloudflare-dns -o cat | jq -c 'select(.status == "updated")'
+journalctl -u cloudflare-dns -o cat | jq -c 'select(.level != "debug")'
 ```
 
 | Exit status | Meaning |
@@ -165,7 +158,7 @@ journalctl -u cloudflare-dns -o cat | jq -c 'select(.status == "updated")'
 ### Slack notification (`--notify`)
 
 `sync --notify` sends one Slack message per run. Without `--notify`, nothing is sent even if `SLACK_WEBHOOK_URL` is set.
-The output to stdout and the exit status are the same as without `--notify`.
+The output to stdout and the exit status are the same as without `--notify`, except `level` of `-o json` (`--notify=changes` lowers `unchanged` to `debug`).
 
 | Situation | `--notify` (= `--notify=always`) | `--notify=changes` | Exit status |
 | --- | --- | --- | --- |
