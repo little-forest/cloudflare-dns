@@ -10,9 +10,11 @@ SCRIPT_BASE=`echo $(cd $(dirname $0); pwd)`
 SCRIPT_NAME=`basename $0`
 
 RC_FNAME="cloudflare-dns.conf"
-RC_FILES=(${HOME}/.${RC_FNAME} /etc/${RC_FNAME} ./${RC_FNAME})
-JQ=jq
-JQ_PATH=(/bin/jq /usr/bin/jq /usr/local/bin/jq)
+# search order: the first one found is loaded
+RC_FILES=("./${RC_FNAME}" "${HOME}/.${RC_FNAME}" "/etc/${RC_FNAME}")
+# legacy variables which are no longer supported
+LEGACY_VARS=(DOMAIN IP_SUPPLIER_SCRIPT IP_PROVIDER_SCRIPT)
+CF_API_DEFAULT_BASE="https://api.cloudflare.com/client/v4"
 
 #-------------------------------------------------------------------------------
 #- common functions ------------------------------------------------------------
@@ -101,6 +103,8 @@ __get_tmp_base() { #{{{
   local TMP_BASE
   if [[ `uname` != Darwin ]]; then
     [[ -d /dev/shm ]] && TMP_BASE=/dev/shm/ || TMP_BASE=/tmp/
+  else
+    TMP_BASE="${TMPDIR:-/tmp}"; TMP_BASE="${TMP_BASE%/}/"
   fi
   TMP_BASE="${TMP_BASE}tmp.`basename $0`.$$"
   [[ ! -d "$TMP_BASE" ]] && mkdir "$TMP_BASE"
@@ -108,13 +112,12 @@ __get_tmp_base() { #{{{
 }
 #}}}
 
+# shellcheck disable=SC2120  # -d is optional
 __make_tmp() { #{{{
   local TMP_BASE=`__get_tmp_base`
   local OPT=()
   [[ "$1" == '-d' ]] && OPT+=($1)
-  [[ `uname` == Darwin ]] && OPT+=('-t') || OPT+=('-p')
-  OPT+=("$TMP_BASE")
-  mktemp ${OPT[@]}
+  mktemp ${OPT[@]} "${TMP_BASE}/tmp.XXXXXXXX"
 }
 #}}}
 
@@ -139,172 +142,566 @@ trap '__script_end' EXIT
 # usage
 #{{{
 _usage() {
-  [[ -n "$1" ]] && __show_error "$1"
-  ( ! tty -s || [[ -n "$1" ]] ) && echo "ERROR: $1" >&2
+  if [[ -n "$1" ]]; then
+    _err "$1"
+    [[ "$OUTPUT" != json ]] && echo "Run '$SCRIPT_NAME -h' to show usage." >&2
+    _fatal_exit 2
+  fi
   cat <<- EOM
 	${C_WHITE}Usage:${C_OFF}
-	  $SCRIPT_NAME (get|update|auto-update|show-ip) [-h] [-z ZONE_ID] [-n NAME] [-t TYPE] [-l TTL] [-v VALUE]
-	    get:         Get DNS record (type and name should be specified)
-	    update:      Update DNS A record
-	    auto-update: Update DNS A record using IP_SUPPLIER_SCRIPT
-	    show-ip:     Show IP address using IP_SUPPLIER_SCRIPT
-	          -z : Cloudflare zone ID
-	          -n : DNS record name (ex: example.com)
-	          -t : DNS record type (ex: A, CNAME, TXT, ...)
-	          -v : DNS record value
-	          -l : TTL to set (optional)
-	          -V : Verbose mode
-	          -h : display usage
-	
+	  $SCRIPT_NAME <get|update|sync|show-ip> [options]
+	    get:     Get the target records as a JSON array
+	    update:  Set VALUE (-v) to the target records
+	    sync:    Set the current IP address (IP_COMMAND) to the target records
+	    show-ip: Show the current IP address using IP_COMMAND
+
+	${C_WHITE}Options:${C_OFF}
+	  -c CONF   Config file path              (--config=CONF)
+	  -z ZONE   Cloudflare zone ID (overrides ZONE_ID)
+	  -n SPEC   Target record: NAME[:TYPE[:TTL[:PROXIED]]]  (repeatable)
+	  -v VALUE  Value to set (update only)
+	  -a        All records in the zone (get only)
+	  -N        Dry run (update/sync)         (--dry-run)
+	  -o FMT    text (default) | json  (update/sync)  (--output=FMT)
+	            json: one JSON object per record on stdout, and one JSON object
+	                  per message on stderr (all subcommands)
+	  --notify[=MODE]  Send the result to Slack (sync only)
+	            always (default): every run
+	            changes: only when something is updated, planned or failed
+	  -V        Verbose
+	  -h        Show usage                    (--help)
+
+	  Without -n, all records in RECORDS of the config file are targeted.
+
 	${C_WHITE}Configuration file:${C_OFF}
-	  You can configure some options in ${RC_FILES[*]}.
-	  Here is example configuration.
-	
+	  The first one found in -c, ${RC_FILES[*]} is loaded.
+
 	      CLOUDFLARE_API_TOKEN=XXXXXXXXXXXXXXXXXXXX
 	      ZONE_ID=XXXXXXXXXXXXXXXXXXXX
-	      IP_SUPPLIER_SCRIPT=\"/usr/local/bin/xxxx\"
-	
-	  If both files are specified, ./${RC_FNAME} will take precedence.
-	
+	      IP_COMMAND=(curl -s https://ifconfig.me)
+	      RECORDS=("example.com" "www.example.com:A:300" "vpn.example.com:A::false")
+	      SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXXX   # required for --notify
+	      SLACK_CHANNEL="#channel"                                  # optional
+
+	${C_WHITE}Exit status:${C_OFF}
+	  0: all records are unchanged, updated or planned
+	  1: some records failed, or the IP address could not be acquired
+	  2: usage or configuration error (no API is called)
+
 	${C_WHITE}Example:${C_OFF}
-	  * Get all record set of specified zone.
-	      $SCRIPT_NAME get -z ZONE_ID -V
-	
-	  * Get specified DNS record.
-	      $SCRIPT_NAME get -z ZONE_ID -t A -n example.com
-	
-	  * Update DNS A record.
-	      $SCRIPT_NAME update -z ZONE_ID -t A -n example.com -v IP_ADDRESS
-	
-	  * Auto-Update DNS A record.
-	      (IP address is auto-acquired using IP_SUPPLIER_SCRIPT specified in ${RC_FNAME})
-	      $SCRIPT_NAME auto-update -z ZONE_ID -t A -n example.com
+	  * Show all records in RECORDS.
+	      $SCRIPT_NAME get
+
+	  * Show changes without updating.
+	      $SCRIPT_NAME sync -N
+
+	  * Update records and notify Slack only when something changed.
+	      $SCRIPT_NAME sync --notify=changes
+
+	  * Update a record which is not in RECORDS.
+	      $SCRIPT_NAME update -n other.example.com:A:auto -v 203.0.113.5
 	EOM
-  exit 1
+  exit 0
 }
 #}}}
 
-_get_record() { #{{{
-  local ZONE_ID="$1"
-  local NAME="$2"
-  local TYPE="$3"
-
-  local Q=".result[]"
-  if [[ -n "${TYPE}" ]]; then
-    Q="$Q | select(.name == \"${NAME}\" and .type == \"${TYPE}\")"
-  elif [[ -n "${NAME}" ]]; then
-    Q="$Q | select(.name == \"${NAME}\")"
+# print a message to stderr. LEVEL: error | warning | debug
+# with -o json, print {level, message[, hint]} in one line without color. otherwise print
+# "[ERROR] MSG" for error, MSG as it is for the others, and HINT in the following lines
+_log() { #{{{
+  local LEVEL="$1" MSG="$2" HINT="$3"
+  if [[ "$OUTPUT" == json ]]; then
+    jq -cnM --arg level "$LEVEL" --arg message "$MSG" --arg hint "$HINT" \
+      '{level: $level, message: $message} + (if $hint == "" then {} else {hint: $hint} end)' >&2
+    return
   fi
-
-  curl -s https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records \
-    -H 'Content-Type: application/json' \
-    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-    | jq "${Q}"
-}
-#}}}
-
-_update() { #{{{
-  local ZONE_ID=$1
-  local DOMAIN=$2
-  local TYPE=$3
-  local VALUE=$4
-  local TTL=$5
-
-  [[ ! "$DOMAIN" ]] && _usage "Domain is not specified."
-  [[ ! "$TYPE" ]] && _usage "Type is not specified."
-  [[ ! "$VALUE" ]] && _usage "Value is not specified."
-
-  local CHANGED=no
-
-  local T_RESULT=`__make_tmp`
-  _get_record "${ZONE_ID}" "${DOMAIN}" "${TYPE}" > $T_RESULT
-
-  local RECORD_ID=`jq -r '.id' ${T_RESULT}`
-  [[ ! "${RECORD_ID}" =~ ^[0-9a-f]+$ ]] && __error_end "Could not get record id : ${DOMAIN} ${TYPE}" 
-
-  local CUR_VALUE=`jq -r '.content' ${T_RESULT}`
-  [[ "$CUR_VALUE" != "${VALUE}" ]] && CHANGED=yes
-
-  local CUR_TTL=`jq -r '.ttl' ${T_RESULT}`
-  if [[ -n "${TTL}" ]]; then
-    [[ "$CUR_TTL" != "${TTL}" ]] && CHANGED=yes
+  if [[ "$LEVEL" != error ]]; then
+    echo "$MSG" >&2
+  elif [[ -t 2 ]]; then
+    echo -e "[${C_RED}ERROR${C_OFF}] $MSG" >&2
   else
-    TTL=${CUR_TTL}
+    echo "[ERROR] $MSG" >&2
   fi
-
-  [[ "${CHANGED}" != 'yes' ]] && return
-
-  local COMMENT="Updated by ${SCRIPT_NAME} at `date '+%Y-%m-%dT%H:%M:%S%z'`"
-  local T_RESPONSE=`__make_tmp`
-  curl -s -X PATCH \
-    https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID} \
-    -H 'Content-Type: application/json' \
-    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-    --data "{\"content\": \"${VALUE}\", \"ttl\": ${TTL}, \"comment\": \"${COMMENT}\"}" \
-    > ${T_RESPONSE} || __error_end "Failed to call Cloudflare API : ${DOMAIN} ${TYPE}"
-  cat ${T_RESPONSE}
-
-  # check API result
-  [[ `jq -r '.success' ${T_RESPONSE} 2>/dev/null` == 'true' ]] \
-    || __error_end "Failed to update record : ${DOMAIN} ${TYPE} : `jq -c '.errors' ${T_RESPONSE} 2>/dev/null`"
+  [[ -n "$HINT" ]] && echo "$HINT" >&2
+  return 0
 }
 #}}}
 
-_auto_update() { #{{{
-  local ZONE_ID="$1"
-  local DOMAIN="$2"
-  local TYPE="$3"
-  local TTL="$4"
-
-  local IP=`_show_ip SILENT`
-  [[ ! "$IP" ]] && IP='(empty result)'
-  _validate_ip "$IP" || __error_end "Invalid address. : $IP"
-
-  _update "${ZONE_ID}" "${DOMAIN}" "${TYPE}" "${IP}" "${TTL}"
+# print error message to stderr, and keep it in ERR_LOG for the Slack notification
+# HINT (optional) is printed only to stderr
+_err() { #{{{
+  ERR_LOG+=("$1")
+  _log error "$1" "$2"
 }
 #}}}
 
-_show_ip() { #{{{
-  local SILENT="$1"
-  if [[ ! "${IP_SUPPLIER_SCRIPT}" ]]; then
-    __error_end "IP_SUPPLIER_SCRIPT is not specified."
-  fi
-  local SCRIPT=(${IP_SUPPLIER_SCRIPT})
-  if ! which "${SCRIPT[0]}" > /dev/null 2>&1; then
-    if [[ ! -x "${SCRIPT[0]}" ]]; then
-      __error_end "${SCRIPT[0]} is not executable."
+# print error message and exit (default exit code: 1)
+_die() { #{{{
+  _err "$1"; _fatal_exit "${2:-1}"
+}
+#}}}
+
+# exit with RC. once NOTIFY_ARMED is set, the error is also sent to Slack
+_fatal_exit() { #{{{
+  [[ -n "$NOTIFY_ARMED" ]] && _notify_fatal
+  exit "$1"
+}
+#}}}
+
+_verbose() { #{{{
+  [[ -n "$VERBOSE" ]] && _log debug "$*"
+}
+#}}}
+
+# convert long options into short ones, then store them in ARGS
+_normalize_long_opts() { #{{{
+  ARGS=()
+  local A END_OF_OPTS=
+  for A in "$@"; do
+    if [[ -n "$END_OF_OPTS" ]]; then
+      ARGS+=("$A")
+      continue
     fi
+    case "$A" in
+      --dry-run)  ARGS+=(-N) ;;
+      --output=*) ARGS+=(-o "${A#--output=}") ;;
+      --config=*) ARGS+=(-c "${A#--config=}") ;;
+      --notify)   OPT_NOTIFY=always ;;
+      --notify=*)
+        OPT_NOTIFY="${A#--notify=}"
+        [[ "$OPT_NOTIFY" == always || "$OPT_NOTIFY" == changes ]] \
+          || _usage "Invalid notify mode : $OPT_NOTIFY"
+        ;;
+      --help)     ARGS+=(-h) ;;
+      --)         ARGS+=(--); END_OF_OPTS=yes ;;
+      --*)        _usage "Unknown option : $A" ;;
+      *)          ARGS+=("$A") ;;
+    esac
+  done
+}
+#}}}
+
+# load the specified config file, or the first one found in RC_FILES
+_load_config() { #{{{
+  local CONF="$1"
+  local F V CANDIDATES FOUND=()
+
+  if [[ -n "$CONF" ]]; then
+    [[ -f "$CONF" ]] || _die "Config file is not found. : $CONF" 2
+    CANDIDATES=("$CONF")
+  else
+    CANDIDATES=("${RC_FILES[@]}")
+  fi
+
+  for F in "${CANDIDATES[@]}"; do
+    [[ -f "$F" ]] || continue
+    # shellcheck source=/dev/null
+    source "$F" || _die "Failed to load config file. : $F" 2
+    LOADED_RC="$F"
+    break
+  done
+  [[ -n "$LOADED_RC" ]] && _verbose "${LOADED_RC} loaded."
+
+  # refuse legacy variables so that an old config does not silently do nothing
+  for V in "${LEGACY_VARS[@]}"; do
+    [[ -n "$(eval "echo \${${V}+x}")" ]] && FOUND+=("$V")
+  done
+  if [[ ${#FOUND[@]} -gt 0 ]]; then
+    local HINT
+    HINT=$(cat <<- EOM
+	  The config format has been changed. Migrate as follows and remove the legacy variables.
+	    DOMAIN=example.com              ->  RECORDS=("example.com")
+	    IP_SUPPLIER_SCRIPT="command"    ->  IP_COMMAND=(command)
+	    IP_PROVIDER_SCRIPT=(command)    ->  IP_COMMAND=(command)
+	  SLACK_* variables in dns-update.conf should also be moved into ${RC_FNAME}.
+	EOM
+    )
+    _err "Legacy variables are found in ${LOADED_RC} : ${FOUND[*]}" "$HINT"
+    exit 2
+  fi
+}
+#}}}
+
+# parse NAME[:TYPE[:TTL[:PROXIED]]] into S_NAME S_TYPE S_TTL S_PROXIED
+# on error, set the reason to S_ERROR and return 1
+_parse_spec() { #{{{
+  local SPEC="$1"
+  local COLONS="${SPEC//[^:]/}"
+  S_NAME='' S_TYPE='' S_TTL='' S_PROXIED='' S_ERROR=''
+
+  if [[ ${#COLONS} -gt 3 ]]; then
+    S_ERROR="too many fields"; return 1
+  fi
+  IFS=: read -r S_NAME S_TYPE S_TTL S_PROXIED <<<"$SPEC"
+
+  # NAME: strip the trailing dot and lower the case
+  S_NAME=$(tr '[:upper:]' '[:lower:]' <<<"${S_NAME%.}")
+  if [[ -z "$S_NAME" ]]; then
+    S_ERROR="name is empty"; return 1
+  fi
+  if [[ ! "$S_NAME" =~ ^[a-z0-9_*][a-z0-9_*.-]*$ ]]; then
+    S_ERROR="invalid name '$S_NAME'"; return 1
+  fi
+
+  # TYPE: only A is supported for now
+  S_TYPE=$(tr '[:lower:]' '[:upper:]' <<<"${S_TYPE:-A}")
+  if [[ "$S_TYPE" != A ]]; then
+    S_ERROR="unsupported type '$S_TYPE'"; return 1
+  fi
+
+  # TTL: empty keeps the current value
+  if [[ "$S_TTL" == auto ]]; then
+    S_TTL=1
+  elif [[ -n "$S_TTL" ]]; then
+    if [[ ! "$S_TTL" =~ ^[0-9]{1,5}$ ]] || (( 10#$S_TTL < 1 || 10#$S_TTL > 86400 )); then
+      S_ERROR="invalid TTL '$S_TTL'"; return 1
+    fi
+    S_TTL=$((10#$S_TTL))
+  fi
+
+  # PROXIED: empty keeps the current value
+  case "$S_PROXIED" in
+    ''|true|false) ;;
+    *) S_ERROR="invalid PROXIED '$S_PROXIED'"; return 1 ;;
+  esac
+  return 0
+}
+#}}}
+
+# validate all target specs (-n or RECORDS) and store them in TARGETS
+# as normalized "NAME:TYPE:TTL:PROXIED". exit 2 if any of them is invalid.
+_collect_targets() { #{{{
+  local SPECS=() ERRORS=() KEYS=$'\n'
+  local SPEC KEY E
+
+  if [[ ${#NAME_OPTS[@]} -gt 0 ]]; then
+    SPECS=("${NAME_OPTS[@]}")
+  else
+    SPECS=("${RECORDS[@]}")
+  fi
+  [[ ${#SPECS[@]} -eq 0 ]] && _usage "No target records. Specify -n or RECORDS in the config file."
+
+  TARGETS=()
+  for SPEC in "${SPECS[@]}"; do
+    if ! _parse_spec "$SPEC"; then
+      ERRORS+=("Invalid record spec '$SPEC' : $S_ERROR")
+      continue
+    fi
+    KEY="${S_NAME}:${S_TYPE}"
+    if [[ "$KEYS" == *$'\n'"${KEY}"$'\n'* ]]; then
+      ERRORS+=("Duplicated record spec '$SPEC' : $KEY")
+      continue
+    fi
+    KEYS+="${KEY}"$'\n'
+    TARGETS+=("${S_NAME}:${S_TYPE}:${S_TTL}:${S_PROXIED}")
+  done
+
+  if [[ ${#ERRORS[@]} -gt 0 ]]; then
+    for E in "${ERRORS[@]}"; do
+      _err "$E"
+    done
+    _fatal_exit 2
+  fi
+}
+#}}}
+
+# call Cloudflare API. the response is stored in CF_RESP.
+# on failure, set the reason to CF_ERROR, print it to stderr and return 1
+_cf_api() { #{{{
+  local METHOD="$1"
+  local API_PATH="$2"
+  local DATA="$3"
+  local URL="${CF_API_BASE:-$CF_API_DEFAULT_BASE}${API_PATH}"
+  local OPTS=(-sS -X "$METHOD" -H 'Content-Type: application/json'
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+  [[ -n "$DATA" ]] && OPTS+=(--data "$DATA")
+
+  CF_RESP='' CF_ERROR=''
+  _verbose "$METHOD $URL"
+  # keep the error of curl in the error message instead of letting it go to stderr.
+  # it is not added to CF_ERROR, which is shown in the result of each record
+  local RC CURL_ERR DETAIL=''
+  # shellcheck disable=SC2119
+  CURL_ERR=$(__make_tmp)
+  CF_RESP=$(curl "${OPTS[@]}" "$URL" 2>"$CURL_ERR"); RC=$?
+  if [[ $RC -ne 0 ]]; then
+    CF_ERROR="failed to call Cloudflare API (curl exit code: $RC)"
+    [[ -s "$CURL_ERR" ]] && DETAIL=" ($(<"$CURL_ERR"))"
+  elif ! jq -e '.success == true' <<<"$CF_RESP" >/dev/null 2>&1; then
+    CF_ERROR=$(jq -r '[.errors[]? | "\(.code): \(.message)"] | join("; ")' <<<"$CF_RESP" 2>/dev/null)
+    [[ -z "$CF_ERROR" ]] && CF_ERROR="invalid response from Cloudflare API"
+  fi
+  if [[ -n "$CF_ERROR" ]]; then
+    _err "$METHOD $API_PATH : ${CF_ERROR}${DETAIL}"
+    return 1
+  fi
+  return 0
+}
+#}}}
+
+# find a single record by name and type. the record is stored in REC.
+# on failure, set the reason to FIND_ERROR and return 1
+_find_record() { #{{{
+  local NAME="$1"
+  local TYPE="$2"
+  REC='' FIND_ERROR=''
+
+  if ! _cf_api GET "/zones/${ZONE_ID}/dns_records?type=${TYPE}&name=${NAME}&per_page=2"; then
+    FIND_ERROR="$CF_ERROR"; return 1
+  fi
+  local COUNT
+  COUNT=$(jq '.result | length' <<<"$CF_RESP")
+  if [[ "$COUNT" == 0 ]]; then
+    FIND_ERROR="record not found"; return 1
+  elif [[ "$COUNT" != 1 ]]; then
+    FIND_ERROR="multiple records"; return 1
+  fi
+  REC=$(jq -c '.result[0]' <<<"$CF_RESP")
+}
+#}}}
+
+# print all records in the zone as a JSON array (all pages)
+_get_all_records() { #{{{
+  local ALL='[]' PAGE=1 TOTAL=1
+  while [[ $PAGE -le $TOTAL ]]; do
+    _cf_api GET "/zones/${ZONE_ID}/dns_records?per_page=100&page=${PAGE}" || return 1
+    ALL=$(printf '%s\n%s\n' "$ALL" "$CF_RESP" | jq -cs '.[0] + .[1].result')
+    TOTAL=$(jq -r '.result_info.total_pages // 1' <<<"$CF_RESP")
+    PAGE=$((PAGE + 1))
+  done
+  jq . <<<"$ALL"
+}
+#}}}
+
+# print the target records as a JSON array. return 1 if any of them is not found
+_get_records() { #{{{
+  local T NAME TYPE RESULTS='' RC=0
+  for T in "${TARGETS[@]}"; do
+    IFS=: read -r NAME TYPE _ <<<"$T"
+    if _find_record "$NAME" "$TYPE"; then
+      RESULTS+="${REC}"$'\n'
+    else
+      _err "${NAME} ${TYPE} : ${FIND_ERROR}"
+      RC=1
+    fi
+  done
+  printf '%s' "$RESULTS" | jq -s .
+  return $RC
+}
+#}}}
+
+# sync a single record to VALUE, then print the result as a JSON line
+_sync_one() { #{{{
+  local SPEC="$1"
+  local VALUE="$2"
+  local NAME TYPE TTL PROXIED BEFORE AFTER BODY COMMENT
+  IFS=: read -r NAME TYPE TTL PROXIED <<<"$SPEC"
+
+  _emit() {
+    jq -cn --arg name "$NAME" --arg type "$TYPE" --arg status "$1" \
+      --argjson before "${2:-null}" --argjson after "${3:-null}" --arg error "$4" \
+      '{name: $name, type: $type, status: $status, before: $before, after: $after,
+        error: (if $error == "" then null else $error end)}'
+  }
+
+  if ! _find_record "$NAME" "$TYPE"; then
+    _emit failed '' '' "$FIND_ERROR"; return
+  fi
+
+  BEFORE=$(jq -c '{content, ttl, proxied}' <<<"$REC")
+  AFTER=$(jq -c --arg content "$VALUE" --arg ttl "$TTL" --arg proxied "$PROXIED" \
+    '. + {content: $content}
+       + (if $ttl == "" then {} else {ttl: ($ttl | tonumber)} end)
+       + (if $proxied == "" then {} else {proxied: ($proxied == "true")} end)' <<<"$BEFORE")
+
+  if [[ $(jq -n --argjson a "$BEFORE" --argjson b "$AFTER" '$a == $b') == true ]]; then
+    _emit unchanged "$BEFORE" "$AFTER"; return
+  fi
+  if [[ -n "$DRY_RUN" ]]; then
+    _emit planned "$BEFORE" "$AFTER"; return
+  fi
+
+  COMMENT="Updated by ${SCRIPT_NAME} at $(date '+%Y-%m-%dT%H:%M:%S%z')"
+  BODY=$(jq -c --arg comment "$COMMENT" '. + {comment: $comment}' <<<"$AFTER")
+  local ID
+  ID=$(jq -r '.id' <<<"$REC")
+  if _cf_api PATCH "/zones/${ZONE_ID}/dns_records/${ID}" "$BODY"; then
+    _emit updated "$BEFORE" "$(jq -c '.result | {content, ttl, proxied}' <<<"$CF_RESP")"
+  else
+    _emit failed "$BEFORE" '' "$CF_ERROR"
+  fi
+}
+#}}}
+
+# sync all TARGETS to VALUE and print the results. return 1 if any of them failed
+_sync_all() { #{{{
+  local VALUE="$1"
+  local T RESULTS='' ALL
+  for T in "${TARGETS[@]}"; do
+    RESULTS+="$(_sync_one "$T" "$VALUE")"$'\n'
+  done
+  ALL=$(printf '%s' "$RESULTS" | jq -cs --arg value "$VALUE" --arg dry "$DRY_RUN" \
+    '{value: $value, dry_run: ($dry != ""), results: .}')
+
+  case "$OUTPUT" in
+    json) _print_json "$ALL" ;;
+    *)    _print_text "$ALL" ;;
+  esac
+
+  if [[ -n "$NOTIFY_MODE" ]]; then
+    local MSG
+    MSG=$(_build_message "$ALL")
+    [[ -n "$MSG" ]] && _send_slack "$MSG"
+  fi
+  [[ $(jq '[.results[] | select(.status == "failed")] | length' <<<"$ALL") == 0 ]]
+}
+#}}}
+
+# build a Slack message from the result JSON of _sync_all
+# print nothing if there is no need to send (NOTIFY_MODE=changes and all unchanged)
+_build_message() { #{{{
+  jq -r --arg mode "$NOTIFY_MODE" '
+    def count($s): [.results[] | select(.status == $s)] | length;
+    def line:
+      if .status == "updated" then "✅ `\(.name)` : `\(.before.content)` → `\(.after.content)`"
+      elif .status == "planned" then "🔜 `\(.name)` : `\(.before.content)` → `\(.after.content)`"
+      elif .status == "unchanged" then "➖ `\(.name)` : `\(.after.content)`"
+      else "❌ `\(.name)` : \(.error)" end;
+    . as $all
+    | "Current IP : `\(.value)`" as $ip
+    | if count("failed") > 0 then
+        "<!channel> Failed to update some DNS records!"
+      elif count("updated") > 0 then
+        "<!channel> IP address has been changed!"
+      elif count("planned") > 0 then
+        "<!channel> IP address has been changed! (not updated)"
+      else null end
+    | if . == null then
+        (if $mode == "changes" then empty else $ip end)
+      else
+        ([., $ip] + [$all.results[] | line]) | join("\n")
+      end
+  ' <<<"$1"
+}
+#}}}
+
+# send TEXT to Slack. a failure is only reported to stderr (the exit status is not changed)
+_send_slack() { #{{{
+  local PAYLOAD CODE CURL_ERR MSG
+  PAYLOAD=$(jq -cn --arg text "$1" --arg channel "$SLACK_CHANNEL" \
+    --arg username "${SLACK_USER:-$(hostname)}" --arg icon "${SLACK_ICON:-:ghost:}" \
+    '{text: $text, username: $username, icon_emoji: $icon}
+       + (if $channel == "" then {} else {channel: $channel} end)')
+  # shellcheck disable=SC2119
+  CURL_ERR=$(__make_tmp)
+  CODE=$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL" 2>"$CURL_ERR")
+  if [[ ! "$CODE" =~ ^2[0-9][0-9]$ ]]; then
+    MSG="Failed to send a message to Slack. (HTTP status: ${CODE:-none})"
+    [[ -s "$CURL_ERR" ]] && MSG+=" ($(<"$CURL_ERR"))"
+    _err "$MSG"
+  fi
+  return 0
+}
+#}}}
+
+# send the last error and the recent ones in ERR_LOG to Slack
+_notify_fatal() { #{{{
+  local N=${#ERR_LOG[@]}
+  local TEXT="<!channel> ${SCRIPT_NAME} failed!"
+  if [[ $N -gt 0 ]]; then
+    TEXT+=$'\n'"${ERR_LOG[N-1]}"
+    TEXT+=$'\n```\n'"$(printf '%s\n' "${ERR_LOG[@]}" | tail -n 20)"$'\n```'
+  fi
+  _send_slack "$TEXT"
+}
+#}}}
+
+# one line per record, without color. a missing before/after (failed) results in null values
+# level: failed -> error, unchanged with --notify=changes -> debug, otherwise info
+# error is present only when the record failed
+_print_json() { #{{{
+  jq -cM --arg mode "$NOTIFY_MODE" '
+    .value as $ip
+    | .results[]
+    | {level: (if .status == "failed" then "error"
+               elif .status == "unchanged" and $mode == "changes" then "debug"
+               else "info" end),
+       currentIP: $ip, status, record: .name, type,
+       oldIP: .before.content, newIP: .after.content,
+       oldDnsProxy: .before.proxied, newDnsProxy: .after.proxied,
+       oldTtl: .before.ttl, newTtl: .after.ttl}
+      + (if .error == null then {} else {error} end)
+  ' <<<"$1"
+}
+#}}}
+
+_print_text() { #{{{
+  local LABEL="Value"
+  [[ "$CMD" == sync ]] && LABEL="Current IP"
+  jq -r --arg heading "$LABEL" '
+    def pad($n): . + (" " * ($n - length));
+    def change($k): if .before[$k] == .after[$k] then empty
+      else " \($k) \(.before[$k]) -> \(.after[$k])" end;
+    (.results | map(.name | length) | max) as $w
+    | "\($heading): \(.value)" + (if .dry_run then " (dry run)" else "" end),
+      (.results[]
+        | "  " + (.status | pad(10)) + " " + (.name | pad($w)) + "  " + .type + "  "
+          + (if .status == "failed" then .error
+             elif .status == "unchanged" then .after.content
+             else "\(.before.content) -> \(.after.content)"
+               + ([change("ttl"), change("proxied")] | if length > 0 then " (" + (join(",") | ltrimstr(" ")) + ")" else "" end)
+             end)),
+      ([.results | group_by(.status)[] | {key: .[0].status, value: length}] | from_entries) as $c
+      | [("updated", "planned", "unchanged", "failed") | select($c[.]) | "\($c[.]) \(.)"] | join(", ")
+  ' <<<"$1"
+}
+#}}}
+
+# get the current IP address into CUR_IP using IP_COMMAND (with retry)
+# not called in a subshell, so that the messages are kept in ERR_LOG
+_get_ip() { #{{{
+  if [[ ${#IP_COMMAND[@]} -eq 0 ]]; then
+    _die "IP_COMMAND is not specified." 2
+  fi
+  if ! command -v "${IP_COMMAND[0]}" > /dev/null 2>&1; then
+    _die "${IP_COMMAND[0]} is not executable." 2
   fi
   local DELAY=(5 10 20 35 60 120 120)
   local CNT=0
+  local IP
 
   while [[ $CNT -lt ${#DELAY[@]} ]]; do
     # execute it
-    local IP=`${SCRIPT[@]}`
+    IP=$("${IP_COMMAND[@]}")
 
     # validate it
-    if _validate_ip "$IP"; then
-      echo "${IP}"
-      return
+    if _validate_ipv4 "$IP"; then
+      CUR_IP="$IP"
+      return 0
     else
       # retry after sleep
-      echo "Invalid IP address, retry after ${DELAY[$CNT]}sec... : $IP" >&2
-      sleep ${DELAY[$CNT]}
-      CNT=$(($CNT + 1))
+      ERR_LOG+=("Invalid IP address, retry after ${DELAY[$CNT]}sec... : $IP")
+      _log warning "Invalid IP address, retry after ${DELAY[$CNT]}sec... : $IP"
+      sleep "${DELAY[$CNT]}"
+      CNT=$((CNT + 1))
     fi
   done
 
-  if [[ ! "$SILENT" ]]; then
-    __error_end "Couldn't get IP address. (Executed: ${IP_SUPPLIER_SCRIPT} Result:$IP)"
-  fi
+  _err "Couldn't get IP address. (Executed: ${IP_COMMAND[*]} Result: $IP)"
+  return 1
 }
 #}}}
 
-_validate_ip() { #{{{
+_validate_ipv4() { #{{{
   local IP="$1"
-  [[ -z "$IP" || "$IP" = "0.0.0.0" || `wc -l <<<"$IP"` -gt 1 ]] && return 1
-  local REGEX='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'
-  [[ -n `sed -nre "/${REGEX}/p" <<<"$IP"` ]] && return 0 || return 1
+  local OCTET
+  [[ "$IP" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  [[ "$IP" == 0.0.0.0 ]] && return 1
+  for OCTET in "${BASH_REMATCH[@]:1}"; do
+    (( 10#$OCTET <= 255 )) || return 1
+  done
+  return 0
 }
 #}}}
 
@@ -312,93 +709,115 @@ _validate_ip() { #{{{
 #- Main process ----------------------------------------------------------------
 #-------------------------------------------------------------------------------
 tty -s && __setupcolor
+ERR_LOG=() OPT_NOTIFY='' NOTIFY_MODE='' NOTIFY_ARMED=''
 
 #- Check dependencies ----------------------------------------------------------
-#{{{
-# jq
-if ! which $JQ > /dev/null 2>&1; then
-  for C in ${JQ_PATH[@]}; do
-    if [[ -x $C ]]; then
-      JQ=$C
-      break;
-    fi
-  done
-  [[ -x $JQ ]] || __error_end "jq executable is not found in ${JQ_PATH[*]}."
-fi
-#}}}
+command -v jq > /dev/null 2>&1 || _die "jq executable is not found." 2
 
 #- Get subcommand --------------------------------------------------------------
 #{{{
+_normalize_long_opts "$@"
+set -- "${ARGS[@]}"
+
 CMD="$1"
 case "$CMD" in
   get) ;;
   update) ;;
-  auto-update) ;;
+  sync) ;;
   show-ip) ;;
   -h|help) _usage ;;
-  *) _usage "Unknown sub command" ;;
+  '') _usage "Sub command is not specified." ;;
+  *) _usage "Unknown sub command : $CMD" ;;
 esac
 shift 1
 #}}}
 
-#- Load configuration ----------------------------------------------------------
-#{{{
-# load before parsing options so that command line options take precedence
-for F in "${RC_FILES[@]}"; do
-  if [[ -f "$F" ]]; then
-    source "$F"
-    LOADED_RC="$F"
-    break
-  fi
-done
-#}}}
-
 #- Get options -----------------------------------------------------------------
 #{{{
-while getopts z:n:t:l:v:Vh OPT; do
+# options are applied after loading the config so that they take precedence
+NAME_OPTS=()
+OUTPUT=text
+while getopts c:z:n:v:aNo:Vh OPT; do
   case "$OPT" in
-    z) ZONE_ID=$OPTARG
+    c) OPT_CONF=$OPTARG
       ;;
-    n) NAME=$OPTARG
+    z) OPT_ZONE_ID=$OPTARG
       ;;
-    t) TYPE=$OPTARG
-      ;;
-    l) TTL=$OPTARG
+    n) NAME_OPTS+=("$OPTARG")
       ;;
     v) VALUE=$OPTARG
       ;;
+    a) ALL_RECORDS=yes
+      ;;
+    N) DRY_RUN=yes
+      ;;
+    o) OUTPUT=$OPTARG
+      ;;
     V) VERBOSE=yes
       ;;
-    h|\?) _usage
+    h) _usage
+      ;;
+    \?) _usage "Invalid option."
       ;;
   esac
 done
-shift `expr $OPTIND - 1`
+shift $((OPTIND - 1))
+[[ $# -gt 0 ]] && _usage "Unexpected arguments : $*"
 #}}}
+
+#- Load configuration ----------------------------------------------------------
+_load_config "$OPT_CONF"
+[[ -n "$OPT_ZONE_ID" ]] && ZONE_ID="$OPT_ZONE_ID"
 
 #- Check options ---------------------------------------------------------------
 #{{{
-[[ "${VERBOSE}" == 'yes' && -n "${LOADED_RC}" ]] && echo "${LOADED_RC} loaded."
+# errors before NOTIFY_ARMED is set are reported only to stderr
+[[ -n "$OPT_NOTIFY" && "$CMD" != sync ]] && _usage "--notify is available only for sync."
+[[ -n "$ALL_RECORDS" && "$CMD" != get ]] && _usage "-a is available only for get."
+[[ -n "$ALL_RECORDS" && ${#NAME_OPTS[@]} -gt 0 ]] && _usage "-a and -n cannot be used together."
+[[ -n "$DRY_RUN" && "$CMD" != update && "$CMD" != sync ]] && _usage "-N is available only for update and sync."
+[[ "$OUTPUT" != text && "$OUTPUT" != json ]] && _usage "Invalid output format : $OUTPUT"
+[[ -n "$VALUE" && "$CMD" != update ]] && _usage "-v is available only for update."
+if [[ "$CMD" == update ]]; then
+  [[ -z "$VALUE" ]] && _usage "Value is not specified."
+  _validate_ipv4 "$VALUE" || _usage "Invalid IPv4 address : $VALUE"
+fi
 
-[[ ! "$ZONE_ID" ]] && _usage "ZONE_ID is not given."
-[[ ! "$CLOUDFLARE_API_TOKEN" ]] && _usage "CLOUDFLARE_API_TOKEN is not given."
+NOTIFY_MODE="$OPT_NOTIFY"
+if [[ -n "$NOTIFY_MODE" ]]; then
+  [[ -z "$SLACK_WEBHOOK_URL" ]] && _usage "SLACK_WEBHOOK_URL is not given. It is required for --notify."
+  NOTIFY_ARMED=yes
+fi
+
+if [[ "$CMD" != show-ip ]]; then
+  [[ -z "$ZONE_ID" ]] && _usage "ZONE_ID is not given."
+  [[ -z "$CLOUDFLARE_API_TOKEN" ]] && _usage "CLOUDFLARE_API_TOKEN is not given."
+  _verbose "Hosted zone id: $ZONE_ID"
+fi
+if [[ "$CMD" != show-ip && -z "$ALL_RECORDS" ]]; then
+  _collect_targets
+fi
 #}}}
 
 #- Main process ----------------------------------------------------------------
-[[ $VERBOSE ]] && echo "Hosted zone id: $ZONE_ID"
-
 case $CMD in
   get)
-    _get_record "${ZONE_ID}" "${NAME}" "${TYPE}"
+    if [[ -n "$ALL_RECORDS" ]]; then
+      _get_all_records
+    else
+      _get_records
+    fi
     ;;
   update)
-    _update "${ZONE_ID}" "${NAME}" "${TYPE}" "${VALUE}" "${TTL}"
+    _sync_all "$VALUE"
     ;;
-  auto-update)
-    _auto_update "${ZONE_ID}" "${NAME}" "${TYPE}" "${TTL}"
+  sync)
+    _get_ip || _fatal_exit 1
+    _sync_all "$CUR_IP"
     ;;
   show-ip)
-    _show_ip
+    _get_ip || exit 1
+    echo "$CUR_IP"
     ;;
 esac
 
