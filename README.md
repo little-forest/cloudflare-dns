@@ -1,4 +1,4 @@
-# cloudflare-dns-update
+# cloudflare-dns
 
 Keep multiple Cloudflare DNS A records in sync with the current global IP address.
 
