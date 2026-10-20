@@ -3,4 +3,4 @@ Description=Notify current home IP address
 
 [Service]
 Type=oneshot
-ExecStart=/opt/cloudflare-dns/cloudflare-dns sync -c /etc/cloudflare-dns.conf -N --notify -o json
+ExecStart=/opt/cloudflare-dns/cloudflare-dns show-ip -c /etc/cloudflare-dns.conf --notify -o json
